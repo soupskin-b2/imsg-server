@@ -334,6 +334,7 @@ async fn run_server(cfg: Config, no_apple: bool) -> Result<()> {
         }
     }
 
+    let _instance_lock = acquire_instance_lock(&cfg.state_dir)?;
     let hub = Arc::new(Hub::new(&cfg)?);
     let relay = Arc::new(RelayHub::load_or_init(&cfg.apple_dir)?);
     let internal_relay = relay.start_internal_bridge().await?;
@@ -362,14 +363,70 @@ async fn run_server(cfg: Config, no_apple: bool) -> Result<()> {
     }
 }
 
-/// True if something is already listening on our address (i.e. the server is running).
+/// True if an `imsg-server` instance is already running for `cfg.state_dir`.
+///
+/// Uses a Unix domain socket in `state_dir` rather than probing `listen_addrs`, so another service
+/// occupying port 443 (like nginx or caddy) is never mistaken for a running `imsg-server`.
 fn already_running(cfg: &Config) -> bool {
-    cfg.listen_addrs.first().map_or(false, |addr| {
-        matches!(
-            std::net::TcpListener::bind(addr.as_str()),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
-        )
-    })
+    already_running_in(&cfg.state_dir)
+}
+
+#[cfg(unix)]
+fn instance_sock_path(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("server.sock")
+}
+
+#[cfg(unix)]
+struct InstanceLock {
+    task: tokio::task::JoinHandle<()>,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn already_running_in(state_dir: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(instance_sock_path(state_dir)).is_ok()
+}
+
+#[cfg(unix)]
+fn acquire_instance_lock(state_dir: &std::path::Path) -> Result<InstanceLock> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = instance_sock_path(state_dir);
+    if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+        anyhow::bail!(
+            "imsg-server is already running for {}",
+            state_dir.display()
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let listener = tokio::net::UnixListener::bind(&path).map_err(|e| {
+        anyhow::anyhow!("failed to create instance socket {}: {}", path.display(), e)
+    })?;
+    config::restrict_permissions(&path);
+    let task = tokio::spawn(async move {
+        while listener.accept().await.is_ok() {}
+    });
+    Ok(InstanceLock { task, path })
+}
+
+#[cfg(not(unix))]
+struct InstanceLock;
+
+#[cfg(not(unix))]
+fn already_running_in(_state_dir: &std::path::Path) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn acquire_instance_lock(_state_dir: &std::path::Path) -> Result<InstanceLock> {
+    Ok(InstanceLock)
 }
 
 fn print_relay_instructions(cfg: &Config, relay: &RelayHub) {
@@ -451,4 +508,32 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn instance_lock_detects_running_server_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "imsg_lock_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!already_running_in(&dir));
+        let lock = acquire_instance_lock(&dir).unwrap();
+        assert!(already_running_in(&dir));
+        assert!(acquire_instance_lock(&dir).is_err());
+
+        drop(lock);
+        assert!(!already_running_in(&dir));
+        let _lock2 = acquire_instance_lock(&dir).unwrap();
+        assert!(already_running_in(&dir));
+
+        drop(_lock2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -410,7 +410,12 @@ pub async fn run_listeners(
     for addr in &cfg.listen_addrs {
         let listener = TcpListener::bind(addr)
             .await
-            .with_context(|| format!("failed to bind {}", addr))?;
+            .with_context(|| {
+                format!(
+                    "failed to bind {} (another service may already be using this port)",
+                    addr
+                )
+            })?;
         let local = listener.local_addr()?;
         info!(
             "listening on {} (tls12_fallback={}, built-in relay enabled)",
