@@ -1809,27 +1809,10 @@ async fn send_imessage(
 /// How long a send waits for every recipient device to confirm (the phone waits 25 seconds).
 const SEND_CONFIRM_WAIT: Duration = Duration::from_secs(12);
 
-/// Which of `targets` can receive iMessage. rustpush keeps a lookup that found no devices for an
-/// hour, and Apple sometimes answers with none (for example right after this server registers), so
-/// a target without devices is looked up once more, fresh, before it counts as not on iMessage.
+/// Which of `targets` can receive iMessage, through rustpush's lookup cache. An answer with no
+/// devices stays cached for an hour; Apple gives those while it throttles a new registration, so
+/// asking again sooner (or clearing the cache) only adds lookups.
 async fn registered_targets(
-    im_client: &IMClient,
-    targets: &[String],
-    me: &str,
-) -> Result<Vec<String>, PushError> {
-    let found = lookup_registered(im_client, targets, me).await?;
-    if targets
-        .iter()
-        .all(|t| found.iter().any(|f| f.eq_ignore_ascii_case(t)))
-    {
-        return Ok(found);
-    }
-    info!("no iMessage devices known for some of {:?}; looking them up again", targets);
-    im_client.identity.invalidate_id_cache().await;
-    lookup_registered(im_client, targets, me).await
-}
-
-async fn lookup_registered(
     im_client: &IMClient,
     targets: &[String],
     me: &str,
