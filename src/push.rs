@@ -2,8 +2,10 @@ use crate::config::{Config, WakeupConfig};
 use crate::proto::{
     bye_reason_name, read_frame, write_frame, Frame, ACK_TIMEOUT_S, BYE_AUTH_FAILED,
     BYE_BAD_VERSION, BYE_PROTOCOL_ERROR, BYE_REPLACED, BYE_SERVER_SHUTDOWN, FALLBACK_INTERVAL_S,
-    PONG_TIMEOUT_S, PROBE_SERVER_IDLE_S, PROTOCOL_VERSION, ROLE_MAIN, ROLE_PAIR, ROLE_PROBE,
+    FRAME_HELLO, PONG_TIMEOUT_S, PROBE_SERVER_IDLE_S, PROTOCOL_VERSION, ROLE_MAIN, ROLE_PAIR,
+    ROLE_PROBE,
 };
+use crate::relay::RelayHub;
 use crate::state::ClientState;
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
@@ -14,12 +16,14 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
@@ -62,6 +66,7 @@ pub struct Hub {
     auth_entries: Mutex<Vec<(String, [u8; 32])>>,
     pair_lock: Mutex<()>,
     wakeup: Option<WakeupConfig>,
+    connect_tx: broadcast::Sender<String>,
     inner: Mutex<HubInner>,
 }
 
@@ -87,12 +92,14 @@ impl Hub {
                 },
             );
         }
+        let (connect_tx, _) = broadcast::channel(64);
         Ok(Self {
             state_dir: cfg.state_dir.clone(),
             config_path: cfg.path.clone(),
             auth_entries: Mutex::new(auth_entries),
             pair_lock: Mutex::new(()),
             wakeup: cfg.wakeup.clone(),
+            connect_tx,
             inner: Mutex::new(HubInner {
                 next_gen: 1,
                 slots,
@@ -104,6 +111,30 @@ impl Hub {
     pub fn client_ids(&self) -> Vec<String> {
         let entries = self.auth_entries.lock().expect("auth mutex poisoned");
         entries.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    pub fn subscribe_connects(&self) -> broadcast::Receiver<String> {
+        self.connect_tx.subscribe()
+    }
+
+    pub fn connected_client_ids(&self) -> Vec<String> {
+        let inner = self.inner.lock().expect("hub mutex poisoned");
+        inner
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| slot.active.as_ref().map(|_| id.clone()))
+            .collect()
+    }
+
+    /// Delivers a body only to clients with an active main connection (avoids queueing stale
+    /// status updates into offline outboxes or triggering wakeups).
+    pub async fn deliver_connected(&self, body: Vec<u8>) {
+        let ids = self.connected_client_ids();
+        for id in ids {
+            if let Err(e) = self.deliver(&id, body.clone()).await {
+                warn!("failed to deliver status to client '{}': {:#}", id, e);
+            }
+        }
     }
 
     /// Checks a one-time pairing code; on success adds a new client and returns (id, token).
@@ -370,6 +401,7 @@ pub fn build_tls_acceptor(cfg: &Config) -> Result<TlsAcceptor> {
 pub async fn run_listeners(
     cfg: &Config,
     hub: Arc<Hub>,
+    relay: Arc<RelayHub>,
     incoming_tx: mpsc::Sender<IncomingClientMsg>,
 ) -> Result<()> {
     let acceptor = build_tls_acceptor(cfg)?;
@@ -381,12 +413,13 @@ pub async fn run_listeners(
             .with_context(|| format!("failed to bind {}", addr))?;
         let local = listener.local_addr()?;
         info!(
-            "listening on {} (tls12_fallback={})",
+            "listening on {} (tls12_fallback={}, built-in relay enabled)",
             local, cfg.tls12_fallback
         );
 
         let acceptor = acceptor.clone();
         let hub = Arc::clone(&hub);
+        let relay = Arc::clone(&relay);
         let incoming_tx = incoming_tx.clone();
 
         join_handles.push(tokio::spawn(async move {
@@ -395,10 +428,18 @@ pub async fn run_listeners(
                     Ok((stream, peer)) => {
                         let acceptor = acceptor.clone();
                         let hub = Arc::clone(&hub);
+                        let relay = Arc::clone(&relay);
                         let incoming_tx = incoming_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_tcp_conn(stream, peer, acceptor, hub, incoming_tx).await
+                            if let Err(e) = handle_tcp_conn(
+                                stream,
+                                peer,
+                                acceptor,
+                                hub,
+                                relay,
+                                incoming_tx,
+                            )
+                            .await
                             {
                                 debug!("connection {} ended: {:#}", peer, e);
                             }
@@ -419,24 +460,104 @@ pub async fn run_listeners(
     Ok(())
 }
 
+/// AsyncRead/AsyncWrite wrapper that yields one already-peeked byte before delegating to `inner`.
+pub struct PrefixedStream<S> {
+    first: Option<u8>,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    pub fn new(first: u8, inner: S) -> Self {
+        Self {
+            first: Some(first),
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(byte) = self.first.take() {
+            if buf.remaining() > 0 {
+                buf.put_slice(&[byte]);
+                return Poll::Ready(Ok(()));
+            } else {
+                self.first = Some(byte);
+                return Poll::Ready(Ok(()));
+            }
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 async fn handle_tcp_conn(
     stream: TcpStream,
     peer: SocketAddr,
     acceptor: TlsAcceptor,
     hub: Arc<Hub>,
+    relay: Arc<RelayHub>,
     incoming_tx: mpsc::Sender<IncomingClientMsg>,
 ) -> Result<()> {
     // Spec §2: Set TCP_NODELAY and leave OS TCP keepalives disabled (default off).
     stream.set_nodelay(true)?;
 
-    let tls_stream = tokio::time::timeout(
+    let mut tls_stream = tokio::time::timeout(
         Duration::from_secs(HANDSHAKE_TIMEOUT_S),
         acceptor.accept(stream),
     )
     .await
     .map_err(|_| anyhow!("TLS handshake timed out"))??;
 
-    handle_stream(tls_stream, peer, hub, incoming_tx).await
+    // Sniff the first decrypted byte to multiplex the phone push protocol (HELLO = 0x01)
+    // and the built-in HTTP/1.1 registration relay (ASCII uppercase method: GET, POST, ...).
+    let mut first = [0u8; 1];
+    let n = tokio::time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT_S),
+        tls_stream.read(&mut first),
+    )
+    .await
+    .map_err(|_| anyhow!("initial byte timed out"))??;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let prefixed = PrefixedStream::new(first[0], tls_stream);
+    if first[0] == FRAME_HELLO {
+        handle_stream(prefixed, peer, hub, incoming_tx).await
+    } else if first[0].is_ascii_uppercase() {
+        relay.handle_http_conn(prefixed, peer).await
+    } else {
+        debug!("{} sent unexpected leading byte 0x{:02x}; closing", peer, first[0]);
+        Ok(())
+    }
 }
 
 async fn handle_stream<S>(
@@ -663,6 +784,7 @@ where
     .await;
 
     if send_ok {
+        let _ = hub.connect_tx.send(client_id.to_string());
         let mut resend_failed = false;
         for (seq, body) in reg.pending {
             if out_tx.send(Frame::Msg { seq, body }).await.is_err() {
@@ -836,4 +958,22 @@ where
         client_id, reg.generation, peer
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn prefixed_stream_replays_first_byte_and_passes_writes() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"ET /health HTTP/1.1\r\n").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut prefixed = PrefixedStream::new(b'G', server);
+        let mut out = String::new();
+        prefixed.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "GET /health HTTP/1.1\r\n");
+    }
 }

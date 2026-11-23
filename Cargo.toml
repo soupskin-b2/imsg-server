@@ -26,6 +26,11 @@ hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 subtle = "2"
+hyper = { version = "0.14", features = ["http1", "server", "runtime", "stream"] }
+tokio-tungstenite = "0.20"
+futures-util = "0.3"
+hmac = "0.12"
+openssl = "0.10"
 
 [profile.release]
 lto = "thin"

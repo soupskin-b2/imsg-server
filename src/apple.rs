@@ -1,13 +1,17 @@
 use crate::body::{
-    AppBody, RECEIPT_DELIVERED, RECEIPT_READ, SETUP_FAILED, SETUP_NEED_SIM, SETUP_READY,
+    AppBody, RECEIPT_DELIVERED, RECEIPT_READ, REG_STATE_FAILED, REG_STATE_NEEDS_PHONE,
+    REG_STATE_OK, REG_STATE_RENEWING, SETUP_FAILED, SETUP_NEED_SIM, SETUP_READY,
     SETUP_WAITING_SMS, SETUP_WORKING,
 };
 use crate::config::Config;
 use crate::push::{Hub, IncomingClientMsg};
+use crate::relay::{RelayHub, RelayStatus};
 use anyhow::{anyhow, bail, Context, Result};
 use keystore::init_keystore;
 use keystore::software::{SoftwareEncryptor, SoftwareKeystore};
 use log::{debug, error, info, warn};
+use openssl::asn1::Asn1Time;
+use openssl::x509::X509;
 use plist::Data;
 use rand::RngCore;
 use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
@@ -15,18 +19,24 @@ use rustpush::findmy::MULTIPLEX_SERVICE;
 use rustpush::{
     authenticate_phone, get_gateways_for_mccmnc, register, APSConnection, APSConnectionResource,
     APSState, AuthPhone, ConversationData, IDSNGMIdentity, IDSUser, IMClient, Message,
-    MessageInst, MessageType, NormalMessage, OSConfig, PushError, RelayConfig, MADRID_SERVICE,
+    MessageInst, MessageType, NormalMessage, OSConfig, PushError, RelayConfig, ResourceFailure,
+    ResourceState, MADRID_SERVICE,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 const IDENTITY_TAG: &str = "imsg-server";
+const MS_PER_DAY: u64 = 86_400_000;
+const RENEWAL_STEP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const PROACTIVE_RETRY_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+const URGENT_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 static KEYSTORE_INIT: Once = Once::new();
 
@@ -37,11 +47,193 @@ struct SavedHardwareState {
     identity: Data,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedAppleStatus {
+    state: String,
+    detail: String,
+    auth_expires_at_ms: Option<u64>,
+    next_rereg_at_ms: Option<u64>,
+    renewal_lead_days: u64,
+    last_success_ms: Option<u64>,
+    last_error: Option<String>,
+    renewal_pending: bool,
+    provider_connected: bool,
+    provider_last_answered_ms: Option<u64>,
+    updated_at_ms: u64,
+}
+
+struct AppleStatusTracker {
+    path: PathBuf,
+    state: u8,
+    detail: String,
+    auth_expires_at_ms: Option<u64>,
+    next_rereg_at_ms: Option<u64>,
+    renewal_lead_days: u64,
+    last_success_ms: Option<u64>,
+    last_error: Option<String>,
+    renewal_pending: bool,
+    provider_connected: bool,
+    provider_last_answered_ms: Option<u64>,
+}
+
+impl AppleStatusTracker {
+    fn new(state_dir: &Path, renewal_lead_days: u64, relay_status: &RelayStatus) -> Self {
+        Self {
+            path: state_dir.join("apple_status.json"),
+            state: REG_STATE_NEEDS_PHONE,
+            detail: String::new(),
+            auth_expires_at_ms: None,
+            next_rereg_at_ms: None,
+            renewal_lead_days,
+            last_success_ms: None,
+            last_error: None,
+            renewal_pending: false,
+            provider_connected: relay_status.provider_connected,
+            provider_last_answered_ms: relay_status.last_answered_ms,
+        }
+    }
+
+    fn update_relay(&mut self, rs: &RelayStatus) -> bool {
+        let changed = self.provider_connected != rs.provider_connected
+            || self.provider_last_answered_ms != rs.last_answered_ms;
+        self.provider_connected = rs.provider_connected;
+        self.provider_last_answered_ms = rs.last_answered_ms;
+        changed
+    }
+
+    fn update_from_users(&mut self, users: &[IDSUser]) {
+        self.auth_expires_at_ms = users_auth_expires_at_ms(users);
+        self.next_rereg_at_ms = users_next_rereg_at_ms(users);
+    }
+
+    fn renew_at_ms(&self) -> u64 {
+        compute_renew_at_ms(self.auth_expires_at_ms, self.renewal_lead_days)
+    }
+
+    fn to_reg_info(&self) -> AppBody {
+        AppBody::RegInfo {
+            auth_expires_at_ms: self.auth_expires_at_ms.unwrap_or(0),
+            next_rereg_at_ms: self.next_rereg_at_ms.unwrap_or(0),
+            renew_at_ms: self.renew_at_ms(),
+            provider_connected: self.provider_connected,
+            state: self.state,
+            detail: self.detail.clone(),
+        }
+    }
+
+    fn save(&self) {
+        let snapshot = PersistedAppleStatus {
+            state: reg_state_name(self.state).to_string(),
+            detail: self.detail.clone(),
+            auth_expires_at_ms: self.auth_expires_at_ms,
+            next_rereg_at_ms: self.next_rereg_at_ms,
+            renewal_lead_days: self.renewal_lead_days,
+            last_success_ms: self.last_success_ms,
+            last_error: self.last_error.clone(),
+            renewal_pending: self.renewal_pending,
+            provider_connected: self.provider_connected,
+            provider_last_answered_ms: self.provider_last_answered_ms,
+            updated_at_ms: now_epoch_ms(),
+        };
+        if let Err(e) = save_json_atomic(&self.path, &snapshot) {
+            warn!("failed to write {}: {:#}", self.path.display(), e);
+        }
+    }
+
+    async fn save_and_broadcast(&self, hub: &Hub) {
+        self.save();
+        if let Ok(encoded) = self.to_reg_info().encode() {
+            hub.deliver_connected(encoded).await;
+        }
+    }
+
+    async fn send_to(&self, hub: &Hub, client_id: &str) {
+        deliver(hub, client_id, self.to_reg_info()).await;
+    }
+}
+
+fn reg_state_name(state: u8) -> &'static str {
+    match state {
+        REG_STATE_OK => "ok",
+        REG_STATE_RENEWING => "renewing",
+        REG_STATE_NEEDS_PHONE => "needs_phone",
+        REG_STATE_FAILED => "failed",
+        _ => "unknown",
+    }
+}
+
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Parses a DER-encoded X.509 certificate and returns its `notAfter` timestamp as epoch milliseconds.
+pub fn cert_not_after_ms(der: &[u8]) -> Result<u64> {
+    let x509 = X509::from_der(der).context("failed to parse DER X.509 certificate")?;
+    let epoch = Asn1Time::from_unix(0)?;
+    let diff = epoch.as_ref().diff(x509.not_after())?;
+    let secs = (diff.days as i64) * 86_400 + (diff.secs as i64);
+    Ok((secs.max(0) as u64).saturating_mul(1000))
+}
+
+fn users_auth_expires_at_ms(users: &[IDSUser]) -> Option<u64> {
+    let phone_min = users
+        .iter()
+        .filter(|u| u.user_id.starts_with("P:"))
+        .filter_map(|u| cert_not_after_ms(&u.auth_keypair.cert).ok())
+        .min();
+    if phone_min.is_some() {
+        return phone_min;
+    }
+    users
+        .iter()
+        .filter_map(|u| cert_not_after_ms(&u.auth_keypair.cert).ok())
+        .min()
+}
+
+fn users_next_rereg_at_ms(users: &[IDSUser]) -> Option<u64> {
+    users
+        .iter()
+        .filter_map(|u| {
+            let reg = u.registration.get("com.apple.madrid")?;
+            if let Some(hbi) = reg.heartbeat_interval_s {
+                Some(reg.registered_at_s.saturating_add(hbi).saturating_mul(1000))
+            } else {
+                cert_not_after_ms(&reg.id_keypair.cert)
+                    .ok()
+                    .map(|ms| ms.saturating_sub(300_000))
+            }
+        })
+        .min()
+}
+
+pub fn compute_renew_at_ms(auth_expires_at_ms: Option<u64>, lead_days: u64) -> u64 {
+    auth_expires_at_ms
+        .map(|exp| exp.saturating_sub(lead_days.saturating_mul(MS_PER_DAY)))
+        .unwrap_or(0)
+}
+
+fn apply_builtin_relay(relay_cfg: &mut RelayConfig, internal_relay: &(String, String)) {
+    relay_cfg.host = internal_relay.0.clone();
+    relay_cfg.code = internal_relay.1.clone();
+    relay_cfg.beeper_token = None;
+}
+
+fn save_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(value)?;
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn save_plist_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -88,6 +280,7 @@ fn init_software_keystore(apple_dir: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", key_path.display()))?;
         f.write_all(&arr)?;
         f.sync_all()?;
+        crate::config::restrict_permissions(&key_path);
         arr
     };
 
@@ -210,7 +403,11 @@ pub fn parse_reg_resp(raw: &str) -> Result<ParsedRegResp> {
     }
 
     if let Some((num, sig_hex)) = trimmed.split_once('|') {
-        let number = num.trim().strip_prefix("tel:").unwrap_or(num.trim()).to_string();
+        let number = num
+            .trim()
+            .strip_prefix("tel:")
+            .unwrap_or(num.trim())
+            .to_string();
         let sig_bytes = hex::decode(sig_hex.trim())
             .with_context(|| format!("invalid hex signature: {}", sig_hex.trim()))?;
         if number.is_empty() {
@@ -234,7 +431,6 @@ pub fn normalize_target(raw: &str) -> String {
     if trimmed.contains('@') {
         return format!("mailto:{}", trimmed);
     }
-    // Strip formatting characters from phone numbers while preserving leading '+'
     let mut cleaned = String::with_capacity(trimmed.len() + 5);
     cleaned.push_str("tel:");
     let mut first = true;
@@ -267,91 +463,131 @@ pub fn pick_sender_handle(handles: &[String], preferred: Option<&str>) -> Option
 pub async fn run_apple(
     cfg: &Config,
     hub: Arc<Hub>,
+    relay: Arc<RelayHub>,
+    internal_relay: (String, String),
     mut incoming_rx: mpsc::Receiver<IncomingClientMsg>,
 ) -> Result<()> {
     init_software_keystore(&cfg.apple_dir)?;
     if cfg.apple_dir.join("id.plist").exists() {
-        return run_bridge(cfg, hub, incoming_rx).await;
+        return run_bridge(cfg, hub, relay, internal_relay, incoming_rx).await;
     }
     info!("not registered with Apple yet; waiting for a paired phone to register its number");
 
+    let mut relay_status_rx = relay.subscribe_status();
+    let mut connect_rx = hub.subscribe_connects();
+    let mut status = AppleStatusTracker::new(
+        &cfg.state_dir,
+        cfg.renewal.lead_days,
+        &relay.status(),
+    );
+    status.state = REG_STATE_NEEDS_PHONE;
+    status.detail = "Not registered yet".to_string();
+    status.save();
+
     let mut setup = PhoneSetup::default();
-    while let Some(msg) = incoming_rx.recv().await {
-        let body = match AppBody::decode(&msg.body) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("client '{}' sent an undecodable body: {:#}", msg.client_id, e);
-                continue;
-            }
-        };
-        let client = msg.client_id.as_str();
-        match body {
-            AppBody::GetHandles => {
-                send_status(&hub, client, SETUP_NEED_SIM, "Send SIM info to register").await;
-            }
-            AppBody::SimInfo { mccmnc, number } => {
-                info!("client '{}' SIM info: mccmnc={} number={:?}", client, mccmnc, number);
-                send_status(&hub, client, SETUP_WORKING, "Activating with Apple...").await;
-                match setup.start(cfg, &mccmnc).await {
-                    Ok((gateway, text)) => {
-                        info!("asking client '{}' to text {} to {}", client, text, gateway);
-                        deliver(&hub, client, AppBody::SendRegSms { gateway, text }).await;
-                        send_status(&hub, client, SETUP_WAITING_SMS, "Waiting for Apple's reply...")
-                            .await;
-                    }
-                    Err(e) => {
-                        warn!("phone setup failed: {:#}", e);
-                        send_status(&hub, client, SETUP_FAILED, &format!("{:#}", e)).await;
+    loop {
+        tokio::select! {
+            changed = relay_status_rx.changed() => {
+                if changed.is_ok() {
+                    let rs = relay_status_rx.borrow().clone();
+                    if status.update_relay(&rs) {
+                        status.save_and_broadcast(&hub).await;
                     }
                 }
             }
-            AppBody::RegResp { text } => {
-                send_status(&hub, client, SETUP_WORKING, "Registering your number...").await;
-                match setup.finish(cfg, &text).await {
-                    Ok(done) => {
-                        info!("registered {} with Apple", done.number);
-                        let ready = AppBody::SetupStatus {
-                            state: SETUP_READY,
-                            detail: done.number.clone(),
-                        };
-                        if let Ok(encoded) = ready.encode() {
-                            let _ = hub.deliver_all(encoded).await;
+            joined = connect_rx.recv() => {
+                if let Ok(cid) = joined {
+                    status.send_to(&hub, &cid).await;
+                }
+            }
+            maybe_msg = incoming_rx.recv() => {
+                let Some(msg) = maybe_msg else { break };
+                let body = match AppBody::decode(&msg.body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("client '{}' sent an undecodable body: {:#}", msg.client_id, e);
+                        continue;
+                    }
+                };
+                let client = msg.client_id.as_str();
+                match body {
+                    AppBody::RegInfoReq => {
+                        status.send_to(&hub, client).await;
+                    }
+                    AppBody::GetHandles => {
+                        send_status(&hub, client, SETUP_NEED_SIM, "Send SIM info to register").await;
+                    }
+                    AppBody::SimInfo { mccmnc, number } => {
+                        info!("client '{}' SIM info: mccmnc={} number={:?}", client, mccmnc, number);
+                        send_status(&hub, client, SETUP_WORKING, "Activating with Apple...").await;
+                        match setup.start(cfg, &internal_relay, &mccmnc).await {
+                            Ok((gateway, text)) => {
+                                info!("asking client '{}' to text {} to {}", client, text, gateway);
+                                deliver(&hub, client, AppBody::SendRegSms { gateway, text }).await;
+                                send_status(&hub, client, SETUP_WAITING_SMS, "Waiting for Apple's reply...")
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("phone setup failed: {:#}", e);
+                                status.last_error = Some(format!("{:#}", e));
+                                status.save();
+                                send_status(&hub, client, SETUP_FAILED, &format!("{:#}", e)).await;
+                            }
                         }
-                        return bridge_with(
-                            cfg,
-                            hub,
-                            incoming_rx,
-                            done.conn,
-                            done.relay,
-                            done.identity,
-                            done.users,
-                        )
-                        .await;
                     }
-                    Err(e) => {
-                        warn!("phone registration failed: {:#}", e);
-                        send_status(&hub, client, SETUP_FAILED, &format!("{:#}", e)).await;
+                    AppBody::RegResp { text } => {
+                        send_status(&hub, client, SETUP_WORKING, "Registering your number...").await;
+                        match setup.finish(cfg, &text).await {
+                            Ok(done) => {
+                                info!("registered {} with Apple", done.number);
+                                let ready = AppBody::SetupStatus {
+                                    state: SETUP_READY,
+                                    detail: done.number.clone(),
+                                };
+                                if let Ok(encoded) = ready.encode() {
+                                    let _ = hub.deliver_all(encoded).await;
+                                }
+                                return bridge_loop(
+                                    cfg,
+                                    hub,
+                                    relay,
+                                    incoming_rx,
+                                    done.conn,
+                                    done.relay,
+                                    done.identity,
+                                    done.users,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                warn!("phone registration failed: {:#}", e);
+                                status.last_error = Some(format!("{:#}", e));
+                                status.save();
+                                send_status(&hub, client, SETUP_FAILED, &format!("{:#}", e)).await;
+                            }
+                        }
                     }
+                    AppBody::SendText { client_msg_id, .. }
+                    | AppBody::SendGroupText { client_msg_id, .. } => {
+                        let reply = AppBody::SendResult {
+                            client_msg_id,
+                            ok: false,
+                            apple_msg_id: None,
+                            error: Some("iMessage is not set up yet".to_string()),
+                        };
+                        deliver(&hub, client, reply).await;
+                    }
+                    AppBody::CheckTargets { req_id, targets } => {
+                        let reply = AppBody::TargetStatus {
+                            req_id,
+                            registered: Vec::new(),
+                            unregistered: targets,
+                        };
+                        deliver(&hub, client, reply).await;
+                    }
+                    other => warn!("client '{}' sent {:?} before setup finished", client, other),
                 }
             }
-            AppBody::SendText { client_msg_id, .. } | AppBody::SendGroupText { client_msg_id, .. } => {
-                let reply = AppBody::SendResult {
-                    client_msg_id,
-                    ok: false,
-                    apple_msg_id: None,
-                    error: Some("iMessage is not set up yet".to_string()),
-                };
-                deliver(&hub, client, reply).await;
-            }
-            AppBody::CheckTargets { req_id, targets } => {
-                let reply = AppBody::TargetStatus {
-                    req_id,
-                    registered: Vec::new(),
-                    unregistered: targets,
-                };
-                deliver(&hub, client, reply).await;
-            }
-            other => warn!("client '{}' sent {:?} before setup finished", client, other),
         }
     }
     Ok(())
@@ -376,6 +612,24 @@ async fn send_status(hub: &Hub, client_id: &str, state: u8, detail: &str) {
     deliver(hub, client_id, body).await;
 }
 
+async fn build_reg_sms_request(conn: &APSConnection, mccmnc: &str) -> Result<(String, String, String)> {
+    let mccmnc = mccmnc.trim();
+    if mccmnc.is_empty() {
+        bail!("No SIM card found. Insert the SIM for the number you want to use.");
+    }
+    let carrier = get_gateways_for_mccmnc(mccmnc)
+        .await
+        .map_err(|e| anyhow!("Apple has no SMS gateway for carrier {} ({})", mccmnc, e))?;
+    let token_hex = hex::encode(conn.get_token().await).to_uppercase();
+    let req_id: u32 = rand::random::<u32>() % 1_900_000_000 + 100_000_000;
+    let req_id_str = req_id.to_string();
+    Ok((
+        carrier.gateway,
+        format!("REG-REQ?v=3;t={};r={};", token_hex, req_id_str),
+        req_id_str,
+    ))
+}
+
 struct Activated {
     relay: RelayConfig,
     identity: IDSNGMIdentity,
@@ -398,25 +652,22 @@ struct PhoneSetup {
 
 impl PhoneSetup {
     /// Activates with Apple if needed and returns (gateway, REG-REQ text) for the phone to send.
-    async fn start(&mut self, cfg: &Config, mccmnc: &str) -> Result<(String, String)> {
-        let mccmnc = mccmnc.trim();
-        if mccmnc.is_empty() {
+    async fn start(
+        &mut self,
+        cfg: &Config,
+        internal_relay: &(String, String),
+        mccmnc: &str,
+    ) -> Result<(String, String)> {
+        if mccmnc.trim().is_empty() {
             bail!("No SIM card found. Insert the SIM for the number you want to use.");
         }
         if self.activated.is_none() {
-            self.activated = Some(activate(cfg).await?);
+            self.activated = Some(activate(cfg, internal_relay).await?);
         }
         let act = self.activated.as_ref().expect("activated");
-        let carrier = get_gateways_for_mccmnc(mccmnc)
-            .await
-            .map_err(|e| anyhow!("Apple has no SMS gateway for carrier {} ({})", mccmnc, e))?;
-        let token_hex = hex::encode(act.conn.get_token().await).to_uppercase();
-        let req_id: u32 = rand::random::<u32>() % 1_900_000_000 + 100_000_000;
-        self.req_id = Some(req_id.to_string());
-        Ok((
-            carrier.gateway,
-            format!("REG-REQ?v=3;t={};r={};", token_hex, req_id),
-        ))
+        let (gateway, text, req_id) = build_reg_sms_request(&act.conn, mccmnc).await?;
+        self.req_id = Some(req_id);
+        Ok((gateway, text))
     }
 
     /// Registers the number from Apple's REG-RESP and saves the credentials.
@@ -424,7 +675,10 @@ impl PhoneSetup {
         let parsed = parse_reg_resp(reg_resp)?;
         if let (Some(want), Some(got)) = (&self.req_id, &parsed.req_id) {
             if want != got {
-                warn!("REG-RESP r={} does not match our request r={}; continuing", got, want);
+                warn!(
+                    "REG-RESP r={} does not match our request r={}; continuing",
+                    got, want
+                );
             }
         }
         let act = self
@@ -444,27 +698,7 @@ impl PhoneSetup {
         .await
         .context("Apple rejected the phone number")?;
         let mut users = vec![phone_user];
-        let reg = register(
-            &*os_cfg,
-            &*act.conn.state.read().await,
-            &[
-                &MADRID_SERVICE,
-                &MULTIPLEX_SERVICE,
-                &FACETIME_SERVICE,
-                &VIDEO_SERVICE,
-            ],
-            &mut users,
-            &act.identity,
-        )
-        .await;
-        if let Err(err) = reg {
-            match err {
-                PushError::CustomerMessage(alert) => {
-                    bail!("Apple rejected the registration: {:?}", alert)
-                }
-                other => return Err(anyhow!(other)).context("IDS registration failed"),
-            }
-        }
+        register_users(&*os_cfg, &act.conn, &mut users, &act.identity).await?;
         save_plist_atomic(&cfg.apple_dir.join("id.plist"), &users)?;
         let hw = SavedHardwareState {
             push: act.conn.state.read().await.clone(),
@@ -488,24 +722,59 @@ impl PhoneSetup {
     }
 }
 
-/// Connects to Apple push, activating a new device through the relay if there is none saved.
-async fn activate(cfg: &Config) -> Result<Activated> {
+async fn register_users(
+    os_cfg: &dyn OSConfig,
+    conn: &APSConnection,
+    users: &mut [IDSUser],
+    identity: &IDSNGMIdentity,
+) -> Result<()> {
+    let reg = register(
+        os_cfg,
+        &*conn.state.read().await,
+        &[
+            &MADRID_SERVICE,
+            &MULTIPLEX_SERVICE,
+            &FACETIME_SERVICE,
+            &VIDEO_SERVICE,
+        ],
+        users,
+        identity,
+    )
+    .await;
+    if let Err(err) = reg {
+        match err {
+            PushError::CustomerMessage(alert) => {
+                bail!("Apple rejected the registration: {:?}", alert)
+            }
+            PushError::DeviceNotFound => {
+                bail!("Built-in relay has no iPhone provider connected")
+            }
+            other => return Err(anyhow!(other)).context("IDS registration failed"),
+        }
+    }
+    Ok(())
+}
+
+/// Connects to Apple push, activating a new device through the built-in relay if there is none saved.
+async fn activate(cfg: &Config, internal_relay: &(String, String)) -> Result<Activated> {
     let hw_path = cfg.apple_dir.join("hw_info.plist");
     let (relay, identity, saved_push) = if hw_path.exists() {
-        let hw: SavedHardwareState = plist::from_file(&hw_path)
+        let mut hw: SavedHardwareState = plist::from_file(&hw_path)
             .with_context(|| format!("failed to load {}", hw_path.display()))?;
+        apply_builtin_relay(&mut hw.relay, internal_relay);
         let identity = IDSNGMIdentity::restore(hw.identity.as_ref(), IDENTITY_TAG)
             .map_err(|e| anyhow!("failed to restore IDSNGMIdentity: {}", e))?;
         (hw.relay, identity, Some(hw.push))
     } else {
-        let r = cfg
-            .relay
-            .as_ref()
-            .ok_or_else(|| anyhow!("The server has no [relay] in config.toml"))?;
-        info!("activating a new device through relay {}", r.host);
-        let version = RelayConfig::get_versions(&r.host, &r.code, &None)
+        info!("activating a new device through built-in registration relay");
+        let version = RelayConfig::get_versions(&internal_relay.0, &internal_relay.1, &None)
             .await
-            .context("Could not reach the registration relay")?;
+            .map_err(|e| match e {
+                PushError::DeviceNotFound => anyhow!(
+                    "Built-in relay has no iPhone provider connected. Check beepserv on your iPhone."
+                ),
+                other => anyhow!("Built-in relay error: {}", other),
+            })?;
         let mut udid_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut udid_bytes);
         let relay = RelayConfig {
@@ -514,15 +783,17 @@ async fn activate(cfg: &Config) -> Result<Activated> {
             aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
             dev_uuid: Uuid::new_v4().to_string(),
             protocol_version: 1660,
-            host: r.host.clone(),
-            code: r.code.clone(),
+            host: internal_relay.0.clone(),
+            code: internal_relay.1.clone(),
             beeper_token: None,
             udid: Some(hex::encode(udid_bytes).to_uppercase()),
         };
-        relay
-            .generate_validation_data()
-            .await
-            .context("The registration relay rejected the request")?;
+        relay.generate_validation_data().await.map_err(|e| match e {
+            PushError::DeviceNotFound => anyhow!(
+                "Built-in relay iPhone provider disconnected while fetching validation data"
+            ),
+            other => anyhow!("Built-in relay rejected validation request: {}", other),
+        })?;
         let identity =
             IDSNGMIdentity::new().map_err(|e| anyhow!("failed to create IDSNGMIdentity: {}", e))?;
         (relay, identity, None)
@@ -538,15 +809,19 @@ async fn activate(cfg: &Config) -> Result<Activated> {
     })
 }
 
-pub async fn run_bridge(
+async fn run_bridge(
     cfg: &Config,
     hub: Arc<Hub>,
+    relay: Arc<RelayHub>,
+    internal_relay: (String, String),
     incoming_rx: mpsc::Receiver<IncomingClientMsg>,
 ) -> Result<()> {
     let hw_path = cfg.apple_dir.join("hw_info.plist");
     let id_path = cfg.apple_dir.join("id.plist");
-    let hw: SavedHardwareState = plist::from_file(&hw_path)
+    let mut hw: SavedHardwareState = plist::from_file(&hw_path)
         .with_context(|| format!("failed to load {}", hw_path.display()))?;
+    // Always point the loaded RelayConfig at the built-in loopback bridge (migrates existing installs).
+    apply_builtin_relay(&mut hw.relay, &internal_relay);
     let users: Vec<IDSUser> = plist::from_file(&id_path)
         .with_context(|| format!("failed to load {}", id_path.display()))?;
     let identity = IDSNGMIdentity::restore(hw.identity.as_ref(), IDENTITY_TAG)
@@ -558,30 +833,182 @@ pub async fn run_bridge(
     if let Some(err) = push_err {
         warn!("APS restore returned error: {}", err);
     }
-    bridge_with(cfg, hub, incoming_rx, conn, hw.relay, identity, users).await
+    bridge_loop(cfg, hub, relay, incoming_rx, conn, hw.relay, identity, users).await
 }
 
-async fn bridge_with(
+enum RenewalPhase {
+    Idle,
+    WaitingForPhone,
+    WaitingForSimInfo {
+        client_id: String,
+        started_at: Instant,
+    },
+    WaitingForRegResp {
+        client_id: String,
+        req_id: String,
+        started_at: Instant,
+    },
+}
+
+struct RenewalController {
+    phase: RenewalPhase,
+    urgent: bool,
+    last_attempt: Option<Instant>,
+}
+
+impl RenewalController {
+    fn new() -> Self {
+        Self {
+            phase: RenewalPhase::Idle,
+            urgent: false,
+            last_attempt: None,
+        }
+    }
+
+    fn is_in_flight(&self) -> bool {
+        matches!(
+            self.phase,
+            RenewalPhase::WaitingForSimInfo { .. } | RenewalPhase::WaitingForRegResp { .. }
+        )
+    }
+
+    fn is_active_or_pending(&self) -> bool {
+        !matches!(self.phase, RenewalPhase::Idle)
+    }
+
+    fn can_start_attempt(&self, urgent: bool) -> bool {
+        let Some(last) = self.last_attempt else {
+            return true;
+        };
+        let cooldown = if urgent {
+            URGENT_RETRY_INTERVAL
+        } else {
+            PROACTIVE_RETRY_INTERVAL
+        };
+        last.elapsed() >= cooldown
+    }
+
+    fn timed_out_client(&self) -> Option<&str> {
+        match &self.phase {
+            RenewalPhase::WaitingForSimInfo {
+                client_id,
+                started_at,
+            }
+            | RenewalPhase::WaitingForRegResp {
+                client_id,
+                started_at,
+                ..
+            } if started_at.elapsed() >= RENEWAL_STEP_TIMEOUT => Some(client_id.as_str()),
+            _ => None,
+        }
+    }
+}
+
+fn is_fatal_auth_failure(failure: &ResourceFailure) -> bool {
+    failure.retry_wait.is_none()
+        || matches!(&*failure.error, PushError::DoNotRetry(_))
+        || failure.error.to_string().contains("6005")
+}
+
+fn format_retryable_failure(failure: &ResourceFailure, provider_connected: bool) -> String {
+    let wait_s = failure.retry_wait.unwrap_or(300);
+    if !provider_connected || matches!(&*failure.error, PushError::DeviceNotFound) {
+        format!("Relay offline, retrying in {}s", wait_s)
+    } else {
+        format!("{}, retrying in {}s", failure.error, wait_s)
+    }
+}
+
+enum SessionOutcome {
+    Shutdown,
+    RestartWithUsers(Vec<IDSUser>),
+}
+
+/// Runs `IMClient` sessions in a loop; after a successful phone-number renewal/re-auth, rebuilds
+/// `IMClient` cleanly on the live `APSConnection` with the fresh `IDSUser` credentials.
+async fn bridge_loop(
     cfg: &Config,
     hub: Arc<Hub>,
+    relay: Arc<RelayHub>,
     mut incoming_rx: mpsc::Receiver<IncomingClientMsg>,
     conn: APSConnection,
-    relay: RelayConfig,
+    relay_cfg: RelayConfig,
     identity: IDSNGMIdentity,
-    users: Vec<IDSUser>,
+    mut users: Vec<IDSUser>,
 ) -> Result<()> {
+    let mut status = AppleStatusTracker::new(
+        &cfg.state_dir,
+        cfg.renewal.lead_days,
+        &relay.status(),
+    );
+    status.state = REG_STATE_OK;
+    status.detail.clear();
+    status.last_success_ms = Some(now_epoch_ms());
+    status.update_from_users(&users);
+    if let Some(exp_ms) = status.auth_expires_at_ms {
+        let days_left = exp_ms.saturating_sub(now_epoch_ms()) / MS_PER_DAY;
+        info!(
+            "Apple phone auth certificate expires in ~{} days (proactive renewal lead={} days)",
+            days_left, cfg.renewal.lead_days
+        );
+    }
+    status.save_and_broadcast(&hub).await;
+
+    loop {
+        let outcome = bridge_session(
+            cfg,
+            &hub,
+            &relay,
+            &mut incoming_rx,
+            &conn,
+            &relay_cfg,
+            &identity,
+            users,
+            &mut status,
+        )
+        .await?;
+
+        match outcome {
+            SessionOutcome::Shutdown => return Ok(()),
+            SessionOutcome::RestartWithUsers(new_users) => {
+                info!("rebuilding IMClient with renewed phone registration");
+                users = new_users;
+                status.state = REG_STATE_OK;
+                status.detail.clear();
+                status.last_error = None;
+                status.last_success_ms = Some(now_epoch_ms());
+                status.renewal_pending = false;
+                status.update_from_users(&users);
+                status.save_and_broadcast(&hub).await;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn bridge_session(
+    cfg: &Config,
+    hub: &Arc<Hub>,
+    relay: &Arc<RelayHub>,
+    incoming_rx: &mut mpsc::Receiver<IncomingClientMsg>,
+    conn: &APSConnection,
+    relay_cfg: &RelayConfig,
+    identity: &IDSNGMIdentity,
+    users: Vec<IDSUser>,
+    status: &mut AppleStatusTracker,
+) -> Result<SessionOutcome> {
     let id_path = cfg.apple_dir.join("id.plist");
 
     // Subscribe to APS messages BEFORE creating/entering the receive loop.
     let mut aps_rx = conn.messages_cont.subscribe();
 
-    let os_cfg: Arc<dyn OSConfig> = Arc::new(relay.clone());
+    let os_cfg: Arc<dyn OSConfig> = Arc::new(relay_cfg.clone());
     let id_path_cb = id_path.clone();
     let im_client = Arc::new(
         IMClient::new(
             conn.clone(),
             users,
-            identity,
+            identity.clone(),
             &[
                 &MADRID_SERVICE,
                 &MULTIPLEX_SERVICE,
@@ -589,7 +1016,7 @@ async fn bridge_with(
                 &VIDEO_SERVICE,
             ],
             cfg.apple_dir.join("id_cache.plist"),
-            os_cfg,
+            Arc::clone(&os_cfg),
             Box::new(move |updated_users| {
                 info!("IdentityManager updated keys; persisting id.plist");
                 if let Err(e) = save_plist_atomic(&id_path_cb, &updated_users) {
@@ -605,7 +1032,7 @@ async fn bridge_with(
 
     // Task 1: Apple -> Push clients
     let rx_client = Arc::clone(&im_client);
-    let rx_hub = Arc::clone(&hub);
+    let rx_hub = Arc::clone(hub);
     let rx_preferred = cfg.preferred_handle.clone();
     let recv_task = tokio::spawn(async move {
         loop {
@@ -733,154 +1160,521 @@ async fn bridge_with(
         }
     });
 
-    // Task 2: Push clients -> Apple
-    let preferred_handle = cfg.preferred_handle.clone();
-    while let Some(msg) = incoming_rx.recv().await {
-        let body = match AppBody::decode(&msg.body) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    "client '{}' seq={} failed to decode body: {:#}",
-                    msg.client_id, msg.seq, e
-                );
-                continue;
-            }
-        };
+    // Subscriptions for status, renewal, provider health, and phone connects.
+    let mut id_state_rx = im_client.identity.resource_state.subscribe();
+    let mut relay_status_rx = relay.subscribe_status();
+    let mut connect_rx = hub.subscribe_connects();
+    let mut renewal_tick = tokio::time::interval(RENEWAL_CHECK_INTERVAL);
 
-        match body {
-            AppBody::GetHandles => {
-                let handles = im_client.identity.get_handles().await.to_vec();
-                let preferred = pick_sender_handle(&handles, preferred_handle.as_deref());
-                let reply = AppBody::Handles { handles, preferred };
-                if let Ok(encoded) = reply.encode() {
-                    if let Err(e) = hub.deliver(&msg.client_id, encoded).await {
-                        warn!("failed to deliver HANDLES: {:#}", e);
+    let mut renewal = RenewalController::new();
+    let mut retryable_identity_failed = false;
+
+    let preferred_handle = cfg.preferred_handle.clone();
+    let mut outcome = SessionOutcome::Shutdown;
+
+    // Immediately evaluate if the loaded cert is already within renewal lead time.
+    maybe_trigger_proactive_renewal(hub, status, &mut renewal).await;
+
+    loop {
+        tokio::select! {
+            changed = id_state_rx.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let state = id_state_rx.borrow().clone();
+                match state {
+                    ResourceState::Generated => {
+                        retryable_identity_failed = false;
+                        let cur_users = im_client.identity.users.read().await.clone();
+                        status.update_from_users(&cur_users);
+                        status.last_success_ms = Some(now_epoch_ms());
+                        status.last_error = None;
+                        if !renewal.is_active_or_pending() {
+                            status.state = REG_STATE_OK;
+                            status.detail.clear();
+                        }
+                        status.save_and_broadcast(hub).await;
+                    }
+                    ResourceState::Generating => {
+                        debug!("IdentityManager re-registering with Apple...");
+                    }
+                    ResourceState::Failed(failure) => {
+                        if is_fatal_auth_failure(&failure) {
+                            warn!("IdentityManager fatal auth failure (re-auth required): {}", failure);
+                            retryable_identity_failed = false;
+                            status.last_error = Some(failure.to_string());
+                            renewal.urgent = true;
+                            if !renewal.is_in_flight() {
+                                start_renewal_with_connected_or_wait(
+                                    hub,
+                                    status,
+                                    &mut renewal,
+                                    "Apple rejected auth (6005); renewing...",
+                                )
+                                .await;
+                            }
+                        } else {
+                            let msg = format_retryable_failure(&failure, status.provider_connected);
+                            warn!("IdentityManager retryable failure: {}", msg);
+                            retryable_identity_failed = true;
+                            status.last_error = Some(msg.clone());
+                            if !renewal.is_active_or_pending() {
+                                status.state = REG_STATE_OK;
+                                status.detail = msg;
+                            }
+                            status.save_and_broadcast(hub).await;
+                        }
+                    }
+                    ResourceState::Closed => {
+                        warn!("IdentityManager closed unexpectedly; scheduling re-auth");
+                        renewal.urgent = true;
+                        if !renewal.is_in_flight() {
+                            start_renewal_with_connected_or_wait(
+                                hub,
+                                status,
+                                &mut renewal,
+                                "Registration stopped; renewing...",
+                            )
+                            .await;
+                        }
                     }
                 }
             }
-            AppBody::SendText {
-                client_msg_id,
-                target,
-                text,
-                sender_guid,
-            } => {
-                let im_client = Arc::clone(&im_client);
-                let hub = Arc::clone(&hub);
-                let preferred = preferred_handle.clone();
-                let client_id = msg.client_id;
 
-                tokio::spawn(async move {
-                    let result = send_imessage(
-                        &im_client,
-                        preferred.as_deref(),
-                        &[target],
+            changed = relay_status_rx.changed() => {
+                if changed.is_ok() {
+                    let rs = relay_status_rx.borrow().clone();
+                    let was_connected = status.provider_connected;
+                    if status.update_relay(&rs) {
+                        status.save_and_broadcast(hub).await;
+                    }
+                    // If the iPhone provider just reconnected while IDS re-reg was backed off,
+                    // poke IdentityManager to retry right away.
+                    if !was_connected && rs.provider_connected && retryable_identity_failed {
+                        info!("relay provider reconnected; retrying IDS re-registration now");
+                        let id = Arc::clone(&im_client.identity);
+                        tokio::spawn(async move {
+                            let _ = id.refresh_now().await;
+                        });
+                    }
+                }
+            }
+
+            joined = connect_rx.recv() => {
+                if let Ok(cid) = joined {
+                    status.send_to(hub, &cid).await;
+                    if matches!(renewal.phase, RenewalPhase::WaitingForPhone) {
+                        info!("client '{}' connected; starting pending phone renewal", cid);
+                        begin_sim_info_request(hub, status, &mut renewal, cid).await;
+                    }
+                }
+            }
+
+            _ = renewal_tick.tick() => {
+                if let Some(cid) = renewal.timed_out_client().map(str::to_string) {
+                    warn!(
+                        "phone renewal attempt with '{}' timed out after {}s",
+                        cid,
+                        RENEWAL_STEP_TIMEOUT.as_secs()
+                    );
+                    renewal.last_attempt = Some(Instant::now());
+                    renewal.phase = RenewalPhase::Idle;
+                    status.last_error = Some("Phone renewal timed out".to_string());
+                    if renewal.urgent {
+                        status.state = REG_STATE_FAILED;
+                        status.detail = "Renewal timed out; will retry".to_string();
+                        status.renewal_pending = true;
+                    } else {
+                        status.state = REG_STATE_OK;
+                        status.detail = "Renewal timed out; retrying tomorrow".to_string();
+                        status.renewal_pending = false;
+                    }
+                    status.save_and_broadcast(hub).await;
+                } else if matches!(renewal.phase, RenewalPhase::Idle) {
+                    if renewal.urgent && renewal.can_start_attempt(true) {
+                        start_renewal_with_connected_or_wait(
+                            hub,
+                            status,
+                            &mut renewal,
+                            "Retrying iMessage renewal...",
+                        )
+                        .await;
+                    } else {
+                        maybe_trigger_proactive_renewal(hub, status, &mut renewal).await;
+                    }
+                }
+            }
+
+            maybe_msg = incoming_rx.recv() => {
+                let Some(msg) = maybe_msg else {
+                    break;
+                };
+                let body = match AppBody::decode(&msg.body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(
+                            "client '{}' seq={} failed to decode body: {:#}",
+                            msg.client_id, msg.seq, e
+                        );
+                        continue;
+                    }
+                };
+
+                match body {
+                    AppBody::RegInfoReq => {
+                        status.send_to(hub, &msg.client_id).await;
+                    }
+                    AppBody::GetHandles => {
+                        let handles = im_client.identity.get_handles().await.to_vec();
+                        let preferred = pick_sender_handle(&handles, preferred_handle.as_deref());
+                        let reply = AppBody::Handles { handles, preferred };
+                        deliver(hub, &msg.client_id, reply).await;
+                    }
+                    AppBody::SendText {
+                        client_msg_id,
+                        target,
                         text,
                         sender_guid,
-                    )
-                    .await;
+                    } => {
+                        let im_client = Arc::clone(&im_client);
+                        let hub = Arc::clone(hub);
+                        let preferred = preferred_handle.clone();
+                        let client_id = msg.client_id;
 
-                    let reply = match result {
-                        Ok(apple_id) => AppBody::SendResult {
-                            client_msg_id,
-                            ok: true,
-                            apple_msg_id: Some(apple_id),
-                            error: None,
-                        },
-                        Err(e) => AppBody::SendResult {
-                            client_msg_id,
-                            ok: false,
-                            apple_msg_id: None,
-                            error: Some(format!("{:#}", e)),
-                        },
-                    };
+                        tokio::spawn(async move {
+                            let result = send_imessage(
+                                &im_client,
+                                preferred.as_deref(),
+                                &[target],
+                                text,
+                                sender_guid,
+                            )
+                            .await;
 
-                    if let Ok(encoded) = reply.encode() {
-                        if let Err(e) = hub.deliver(&client_id, encoded).await {
-                            warn!("failed to deliver SEND_RESULT: {:#}", e);
-                        }
+                            let reply = match result {
+                                Ok(apple_id) => AppBody::SendResult {
+                                    client_msg_id,
+                                    ok: true,
+                                    apple_msg_id: Some(apple_id),
+                                    error: None,
+                                },
+                                Err(e) => AppBody::SendResult {
+                                    client_msg_id,
+                                    ok: false,
+                                    apple_msg_id: None,
+                                    error: Some(format!("{:#}", e)),
+                                },
+                            };
+
+                            deliver(&hub, &client_id, reply).await;
+                        });
                     }
-                });
-            }
-            AppBody::SendGroupText {
-                client_msg_id,
-                participants,
-                text,
-                sender_guid,
-            } => {
-                let im_client = Arc::clone(&im_client);
-                let hub = Arc::clone(&hub);
-                let preferred = preferred_handle.clone();
-                let client_id = msg.client_id;
-
-                tokio::spawn(async move {
-                    let result = send_imessage(
-                        &im_client,
-                        preferred.as_deref(),
-                        &participants,
+                    AppBody::SendGroupText {
+                        client_msg_id,
+                        participants,
                         text,
                         sender_guid,
-                    )
-                    .await;
+                    } => {
+                        let im_client = Arc::clone(&im_client);
+                        let hub = Arc::clone(hub);
+                        let preferred = preferred_handle.clone();
+                        let client_id = msg.client_id;
 
-                    let reply = match result {
-                        Ok(apple_id) => AppBody::SendResult {
-                            client_msg_id,
-                            ok: true,
-                            apple_msg_id: Some(apple_id),
-                            error: None,
-                        },
-                        Err(e) => AppBody::SendResult {
-                            client_msg_id,
-                            ok: false,
-                            apple_msg_id: None,
-                            error: Some(format!("{:#}", e)),
-                        },
-                    };
+                        tokio::spawn(async move {
+                            let result = send_imessage(
+                                &im_client,
+                                preferred.as_deref(),
+                                &participants,
+                                text,
+                                sender_guid,
+                            )
+                            .await;
 
-                    if let Ok(encoded) = reply.encode() {
-                        if let Err(e) = hub.deliver(&client_id, encoded).await {
-                            warn!("failed to deliver group SEND_RESULT: {:#}", e);
+                            let reply = match result {
+                                Ok(apple_id) => AppBody::SendResult {
+                                    client_msg_id,
+                                    ok: true,
+                                    apple_msg_id: Some(apple_id),
+                                    error: None,
+                                },
+                                Err(e) => AppBody::SendResult {
+                                    client_msg_id,
+                                    ok: false,
+                                    apple_msg_id: None,
+                                    error: Some(format!("{:#}", e)),
+                                },
+                            };
+
+                            deliver(&hub, &client_id, reply).await;
+                        });
+                    }
+                    AppBody::CheckTargets { req_id, targets } => {
+                        let im_client = Arc::clone(&im_client);
+                        let hub = Arc::clone(hub);
+                        let preferred = preferred_handle.clone();
+                        let client_id = msg.client_id;
+
+                        tokio::spawn(async move {
+                            let reply = check_imessage_targets(
+                                &im_client,
+                                preferred.as_deref(),
+                                req_id,
+                                targets,
+                            )
+                            .await;
+                            deliver(&hub, &client_id, reply).await;
+                        });
+                    }
+                    AppBody::SimInfo { mccmnc, number } => {
+                        if renewal.is_active_or_pending() {
+                            info!(
+                                "renewal: client '{}' SIM info mccmnc={} number={:?}",
+                                msg.client_id, mccmnc, number
+                            );
+                            match build_reg_sms_request(conn, &mccmnc).await {
+                                Ok((gateway, text, req_id)) => {
+                                    info!(
+                                        "renewal: asking client '{}' to text {} to {}",
+                                        msg.client_id, text, gateway
+                                    );
+                                    deliver(
+                                        hub,
+                                        &msg.client_id,
+                                        AppBody::SendRegSms { gateway, text },
+                                    )
+                                    .await;
+                                    send_status(
+                                        hub,
+                                        &msg.client_id,
+                                        SETUP_WAITING_SMS,
+                                        "Waiting for Apple's reply...",
+                                    )
+                                    .await;
+                                    renewal.phase = RenewalPhase::WaitingForRegResp {
+                                        client_id: msg.client_id.clone(),
+                                        req_id,
+                                        started_at: Instant::now(),
+                                    };
+                                    status.state = REG_STATE_RENEWING;
+                                    status.detail = "Waiting for Apple SMS reply...".to_string();
+                                    status.save_and_broadcast(hub).await;
+                                }
+                                Err(e) => {
+                                    warn!("renewal SIM_INFO step failed: {:#}", e);
+                                    fail_renewal_attempt(hub, status, &mut renewal, format!("{:#}", e))
+                                        .await;
+                                }
+                            }
+                        } else {
+                            let handles = im_client.identity.get_handles().await.to_vec();
+                            let detail = handles.first().cloned().unwrap_or_default();
+                            send_status(hub, &msg.client_id, SETUP_READY, &detail).await;
                         }
                     }
-                });
-            }
-            AppBody::CheckTargets { req_id, targets } => {
-                let im_client = Arc::clone(&im_client);
-                let hub = Arc::clone(&hub);
-                let preferred = preferred_handle.clone();
-                let client_id = msg.client_id;
+                    AppBody::RegResp { text } => {
+                        if renewal.is_active_or_pending() {
+                            let expected_req_id = match &renewal.phase {
+                                RenewalPhase::WaitingForRegResp { req_id, .. } => {
+                                    Some(req_id.clone())
+                                }
+                                _ => None,
+                            };
+                            status.state = REG_STATE_RENEWING;
+                            status.detail = "Registering renewed number with Apple...".to_string();
+                            status.save_and_broadcast(hub).await;
 
-                tokio::spawn(async move {
-                    let reply = check_imessage_targets(
-                        &im_client,
-                        preferred.as_deref(),
-                        req_id,
-                        targets,
-                    )
-                    .await;
-                    if let Ok(encoded) = reply.encode() {
-                        if let Err(e) = hub.deliver(&client_id, encoded).await {
-                            warn!("failed to deliver TARGET_STATUS: {:#}", e);
+                            let current_users = im_client.identity.users.read().await.clone();
+                            match finish_phone_renewal(
+                                cfg,
+                                conn,
+                                &*os_cfg,
+                                identity,
+                                current_users,
+                                &text,
+                                expected_req_id.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok((new_users, number)) => {
+                                    info!("successfully renewed Apple phone registration for {}", number);
+                                    let ready = AppBody::SetupStatus {
+                                        state: SETUP_READY,
+                                        detail: number,
+                                    };
+                                    if let Ok(encoded) = ready.encode() {
+                                        hub.deliver_connected(encoded).await;
+                                    }
+                                    outcome = SessionOutcome::RestartWithUsers(new_users);
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("phone renewal failed: {:#}", e);
+                                    fail_renewal_attempt(hub, status, &mut renewal, format!("{:#}", e))
+                                        .await;
+                                }
+                            }
+                        } else {
+                            let handles = im_client.identity.get_handles().await.to_vec();
+                            let detail = handles.first().cloned().unwrap_or_default();
+                            send_status(hub, &msg.client_id, SETUP_READY, &detail).await;
                         }
                     }
-                });
-            }
-            AppBody::SimInfo { .. } | AppBody::RegResp { .. } => {
-                let handles = im_client.identity.get_handles().await.to_vec();
-                let detail = handles.first().cloned().unwrap_or_default();
-                send_status(&hub, &msg.client_id, SETUP_READY, &detail).await;
-            }
-            other => {
-                warn!(
-                    "client '{}' seq={} sent unsupported upstream body: {:?}",
-                    msg.client_id, msg.seq, other
-                );
+                    other => {
+                        warn!(
+                            "client '{}' seq={} sent unsupported upstream body: {:?}",
+                            msg.client_id, msg.seq, other
+                        );
+                    }
+                }
             }
         }
     }
 
     recv_task.abort();
-    Ok(())
+    im_client.identity.close();
+    Ok(outcome)
+}
+
+async fn maybe_trigger_proactive_renewal(
+    hub: &Hub,
+    status: &mut AppleStatusTracker,
+    renewal: &mut RenewalController,
+) {
+    if !matches!(renewal.phase, RenewalPhase::Idle) {
+        return;
+    }
+    let renew_at = status.renew_at_ms();
+    if renew_at == 0 {
+        return;
+    }
+    let now = now_epoch_ms();
+    if now < renew_at {
+        return;
+    }
+    let expired = status.auth_expires_at_ms.map_or(false, |e| now >= e);
+    if expired {
+        renewal.urgent = true;
+    }
+    if !renewal.can_start_attempt(renewal.urgent) {
+        return;
+    }
+    info!(
+        "phone auth cert within {}d renewal window (expired={}); starting automatic renewal",
+        status.renewal_lead_days, expired
+    );
+    start_renewal_with_connected_or_wait(
+        hub,
+        status,
+        renewal,
+        "Renewing iMessage registration...",
+    )
+    .await;
+}
+
+async fn start_renewal_with_connected_or_wait(
+    hub: &Hub,
+    status: &mut AppleStatusTracker,
+    renewal: &mut RenewalController,
+    detail: &str,
+) {
+    if let Some(cid) = hub.connected_client_ids().into_iter().next() {
+        begin_sim_info_request(hub, status, renewal, cid).await;
+    } else {
+        info!("no phone connected for renewal; waiting for a phone to connect");
+        renewal.phase = RenewalPhase::WaitingForPhone;
+        status.state = REG_STATE_NEEDS_PHONE;
+        status.detail = if detail.is_empty() {
+            "Waiting for phone to renew".to_string()
+        } else {
+            detail.to_string()
+        };
+        status.renewal_pending = true;
+        status.save_and_broadcast(hub).await;
+    }
+}
+
+async fn begin_sim_info_request(
+    hub: &Hub,
+    status: &mut AppleStatusTracker,
+    renewal: &mut RenewalController,
+    client_id: String,
+) {
+    info!("starting SMS renewal with client '{}'", client_id);
+    renewal.phase = RenewalPhase::WaitingForSimInfo {
+        client_id: client_id.clone(),
+        started_at: Instant::now(),
+    };
+    status.state = REG_STATE_RENEWING;
+    status.detail = "Renewing registration...".to_string();
+    status.renewal_pending = true;
+    status.save_and_broadcast(hub).await;
+    send_status(hub, &client_id, SETUP_NEED_SIM, "Renewing registration...").await;
+}
+
+async fn fail_renewal_attempt(
+    hub: &Hub,
+    status: &mut AppleStatusTracker,
+    renewal: &mut RenewalController,
+    err: String,
+) {
+    renewal.last_attempt = Some(Instant::now());
+    renewal.phase = RenewalPhase::Idle;
+    status.last_error = Some(err.clone());
+    if renewal.urgent {
+        status.state = REG_STATE_FAILED;
+        status.detail = err;
+        status.renewal_pending = true;
+    } else {
+        // Proactive renewal failed while the existing registration still works; retry tomorrow.
+        status.state = REG_STATE_OK;
+        status.detail = format!("Renewal retry scheduled ({})", err);
+        status.renewal_pending = false;
+    }
+    status.save_and_broadcast(hub).await;
+}
+
+async fn finish_phone_renewal(
+    cfg: &Config,
+    conn: &APSConnection,
+    os_cfg: &dyn OSConfig,
+    identity: &IDSNGMIdentity,
+    mut users: Vec<IDSUser>,
+    reg_resp: &str,
+    expected_req_id: Option<&str>,
+) -> Result<(Vec<IDSUser>, String)> {
+    let parsed = parse_reg_resp(reg_resp)?;
+    if let (Some(want), Some(got)) = (expected_req_id, parsed.req_id.as_deref()) {
+        if want != got {
+            warn!(
+                "renewal REG-RESP r={} does not match our request r={}; continuing",
+                got, want
+            );
+        }
+    }
+    let push_token = conn.get_token().await;
+    let phone_user = authenticate_phone(
+        &parsed.number,
+        AuthPhone {
+            push_token: push_token.to_vec().into(),
+            sigs: vec![parsed.sig_bytes.into()],
+        },
+        os_cfg,
+    )
+    .await
+    .context("Apple rejected the phone number during renewal")?;
+
+    if let Some(slot) = users
+        .iter_mut()
+        .find(|u| u.user_id == phone_user.user_id || u.user_id.starts_with("P:"))
+    {
+        *slot = phone_user;
+    } else {
+        users.push(phone_user);
+    }
+
+    register_users(os_cfg, conn, &mut users, identity).await?;
+    save_plist_atomic(&cfg.apple_dir.join("id.plist"), &users)?;
+    Ok((users, parsed.number))
 }
 
 async fn check_imessage_targets(
@@ -1018,13 +1812,20 @@ async fn send_imessage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::x509::X509Builder;
 
     #[test]
     fn normalize_target_cases() {
         assert_eq!(normalize_target("+1 (555) 123-4567"), "tel:+15551234567");
         assert_eq!(normalize_target("15551234567"), "tel:+15551234567");
         assert_eq!(normalize_target("tel:+15551234567"), "tel:+15551234567");
-        assert_eq!(normalize_target("alice@icloud.com"), "mailto:alice@icloud.com");
+        assert_eq!(
+            normalize_target("alice@icloud.com"),
+            "mailto:alice@icloud.com"
+        );
         assert_eq!(
             normalize_target("mailto:alice@icloud.com"),
             "mailto:alice@icloud.com"
@@ -1065,5 +1866,27 @@ mod tests {
         assert_eq!(p3.req_id, None);
         assert_eq!(p3.number, "+15552223333");
         assert_eq!(p3.sig_bytes, vec![0xca, 0xfe, 0x01]);
+    }
+
+    #[test]
+    fn cert_not_after_and_renew_at_computation() {
+        let rsa = Rsa::generate(1024).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        let nb = Asn1Time::from_unix(1_700_000_000).unwrap();
+        let na = Asn1Time::from_unix(1_800_000_000).unwrap();
+        builder.set_not_before(&nb).unwrap();
+        builder.set_not_after(&na).unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        let der = builder.build().to_der().unwrap();
+
+        let exp_ms = cert_not_after_ms(&der).unwrap();
+        assert_eq!(exp_ms, 1_800_000_000_000);
+        assert_eq!(
+            compute_renew_at_ms(Some(exp_ms), 7),
+            1_800_000_000_000 - 7 * MS_PER_DAY
+        );
     }
 }

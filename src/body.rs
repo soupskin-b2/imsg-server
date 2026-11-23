@@ -13,6 +13,8 @@ pub const BODY_SETUP_STATUS: u8 = 0x0A;
 pub const BODY_SIM_INFO: u8 = 0x0B;
 pub const BODY_SEND_REG_SMS: u8 = 0x0C;
 pub const BODY_REG_RESP: u8 = 0x0D;
+pub const BODY_REG_INFO_REQ: u8 = 0x0E;
+pub const BODY_REG_INFO: u8 = 0x0F;
 
 /// SETUP_STATUS states (server -> phone).
 pub const SETUP_READY: u8 = 0;
@@ -20,6 +22,12 @@ pub const SETUP_NEED_SIM: u8 = 1;
 pub const SETUP_WORKING: u8 = 2;
 pub const SETUP_WAITING_SMS: u8 = 3;
 pub const SETUP_FAILED: u8 = 4;
+
+/// REG_INFO states (server -> phone).
+pub const REG_STATE_OK: u8 = 0;
+pub const REG_STATE_RENEWING: u8 = 1;
+pub const REG_STATE_NEEDS_PHONE: u8 = 2;
+pub const REG_STATE_FAILED: u8 = 3;
 
 pub const RECEIPT_DELIVERED: u8 = 1;
 pub const RECEIPT_READ: u8 = 2;
@@ -90,6 +98,17 @@ pub enum AppBody {
     /// Phone -> server: Apple's REG-RESP reply, as received.
     RegResp {
         text: String,
+    },
+    /// Phone -> server: request current Apple registration / renewal status.
+    RegInfoReq,
+    /// Server -> phone: Apple registration / renewal and built-in relay status.
+    RegInfo {
+        auth_expires_at_ms: u64,
+        next_rereg_at_ms: u64,
+        renew_at_ms: u64,
+        provider_connected: bool,
+        state: u8,
+        detail: String,
     },
 }
 
@@ -313,6 +332,25 @@ impl AppBody {
                 buf.push(BODY_REG_RESP);
                 write_str(&mut buf, text)?;
             }
+            AppBody::RegInfoReq => {
+                buf.push(BODY_REG_INFO_REQ);
+            }
+            AppBody::RegInfo {
+                auth_expires_at_ms,
+                next_rereg_at_ms,
+                renew_at_ms,
+                provider_connected,
+                state,
+                detail,
+            } => {
+                buf.push(BODY_REG_INFO);
+                buf.extend_from_slice(&auth_expires_at_ms.to_be_bytes());
+                buf.extend_from_slice(&next_rereg_at_ms.to_be_bytes());
+                buf.extend_from_slice(&renew_at_ms.to_be_bytes());
+                buf.push(if *provider_connected { 1 } else { 0 });
+                buf.push(*state);
+                write_str(&mut buf, detail)?;
+            }
         }
         Ok(buf)
     }
@@ -385,6 +423,19 @@ impl AppBody {
             },
             BODY_REG_RESP => AppBody::RegResp {
                 text: c.read_str()?,
+            },
+            BODY_REG_INFO_REQ => AppBody::RegInfoReq,
+            BODY_REG_INFO => AppBody::RegInfo {
+                auth_expires_at_ms: c.read_u64()?,
+                next_rereg_at_ms: c.read_u64()?,
+                renew_at_ms: c.read_u64()?,
+                provider_connected: match c.read_u8()? {
+                    0 => false,
+                    1 => true,
+                    v => bail!("invalid bool tag: {}", v),
+                },
+                state: c.read_u8()?,
+                detail: c.read_str()?,
             },
             other => bail!("unknown body kind 0x{:02x}", other),
         };
@@ -473,6 +524,23 @@ mod tests {
                 participants: vec!["tel:+15551234567".into(), "mailto:alice@icloud.com".into()],
                 text: "Group hello".into(),
                 sender_guid: Some("guid-group".into()),
+            },
+            AppBody::RegInfoReq,
+            AppBody::RegInfo {
+                auth_expires_at_ms: 1_800_000_000_000,
+                next_rereg_at_ms: 1_795_000_000_000,
+                renew_at_ms: 1_799_395_200_000,
+                provider_connected: true,
+                state: REG_STATE_OK,
+                detail: "".into(),
+            },
+            AppBody::RegInfo {
+                auth_expires_at_ms: 0,
+                next_rereg_at_ms: 0,
+                renew_at_ms: 0,
+                provider_connected: false,
+                state: REG_STATE_NEEDS_PHONE,
+                detail: "Waiting for phone".into(),
             },
         ];
 

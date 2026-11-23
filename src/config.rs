@@ -21,8 +21,11 @@ pub struct Config {
     pub preferred_handle: Option<String>,
     #[serde(default)]
     pub wakeup: Option<WakeupConfig>,
+    /// Legacy `[relay]` section (ignored; imsg-server always uses its built-in relay).
     #[serde(default)]
-    pub relay: Option<RelayConfig>,
+    pub relay: Option<LegacyRelayConfig>,
+    #[serde(default)]
+    pub renewal: RenewalConfig,
     #[serde(default)]
     pub clients: Vec<ClientConfig>,
     /// Where this config was loaded from (paired phones are appended here).
@@ -34,11 +37,33 @@ fn default_true() -> bool {
     true
 }
 
-/// Registration relay used for Apple activation (validation data).
+/// Kept only so older config.toml files still parse cleanly when upgrading to the built-in relay.
 #[derive(Debug, Clone, Deserialize)]
-pub struct RelayConfig {
-    pub host: String,
-    pub code: String,
+pub struct LegacyRelayConfig {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// Automatic phone-number renewal settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenewalConfig {
+    /// Start proactive phone-number renewal this many days before the auth certificate expires.
+    #[serde(default = "default_renewal_lead_days")]
+    pub lead_days: u64,
+}
+
+impl Default for RenewalConfig {
+    fn default() -> Self {
+        Self {
+            lead_days: default_renewal_lead_days(),
+        }
+    }
+}
+
+fn default_renewal_lead_days() -> u64 {
+    7
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,8 +144,7 @@ pub struct InitArgs {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
     pub listen: String,
-    pub relay_host: String,
-    pub relay_code: String,
+    pub renewal_lead_days: u64,
 }
 
 /// Writes a fresh config.toml. Refuses to overwrite an existing one.
@@ -143,7 +167,8 @@ pub fn init(config_path: &Path, args: &InitArgs) -> Result<()> {
     let text = format!(
         r#"# imsg-server configuration
 
-# Host name phones connect to. Must match the TLS certificate below.
+# Host name phones and the jailbroken iPhone relay provider connect to.
+# Must match the TLS certificate below.
 server_name = "{domain}"
 listen_addrs = ["{listen}"]
 
@@ -155,10 +180,9 @@ key_path = "{key}"
 state_dir = "{state}"
 apple_dir = "{apple}"
 
-# Registration relay used to activate with Apple.
-[relay]
-host = "{relay_host}"
-code = "{relay_code}"
+# Automatic phone-number renewal (sends an SMS to Apple's registration gateway).
+[renewal]
+lead_days = {lead_days}
 
 # Paired phones are added below by `imsg-server pair`.
 "#,
@@ -168,8 +192,7 @@ code = "{relay_code}"
         key = toml_path(&key),
         state = toml_path(&base.join("state")),
         apple = toml_path(&base.join("apple")),
-        relay_host = args.relay_host.trim(),
-        relay_code = args.relay_code.trim(),
+        lead_days = args.renewal_lead_days,
     );
     fs::write(config_path, text)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
