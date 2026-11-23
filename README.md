@@ -199,6 +199,9 @@ the other side act instead:
 | `/react 0`…`/react 5`, `/react 🔥` | reacts to it (love, like, dislike, laugh, emphasize, question, or an emoji) |
 | `/reply text` | answers with an inline reply to it |
 | `/edit text`, `/unsend` | edits or unsends its last echoed message |
+| `/photo`, `/video`, `/voice`, `/sticker` | sends a 12 MP photo, a 1080p MOV, a CAF voice message or a PNG sticker (needs ffmpeg) |
+| `/group text` | starts a group with you and a third person; the next group commands act on it |
+| `/gsay text` | says something in that group |
 | `/rename name`, `/icon` | renames the group, changes its photo |
 | `/add handle`, `/remove handle` | adds or removes a group member (`tel:+1…` or `mailto:…`) |
 

@@ -117,6 +117,34 @@ fn echo_reg_info(
 }
 
 /// Test backend. Simulates phone-number setup (any REG-RESP is accepted), then echoes messages.
+/// A test attachment as an iPhone would send it: a 3024x4032 HEIC-sized photo (JPEG here), a
+/// HEVC-free MOV clip, a CAF voice message, or a transparent PNG sticker.
+fn echo_media(hub: &Arc<Hub>, kind: &str) -> anyhow::Result<body::InAttachment> {
+    let dir = std::env::temp_dir().join(format!("imsg-echo-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let (name, mime, args): (&str, &str, Vec<&str>) = match kind {
+        "photo" => ("IMG_0042.jpg", "image/jpeg",
+            vec!["-f", "lavfi", "-i", "testsrc2=size=3024x4032:rate=1", "-frames:v", "1"]),
+        "video" => ("IMG_0043.mov", "video/quicktime",
+            vec!["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=4", "-f", "lavfi",
+                 "-i", "sine=frequency=660:duration=4", "-c:v", "libx264", "-c:a", "aac", "-shortest"]),
+        "voice" => ("Audio Message.caf", "audio/x-caf",
+            vec!["-f", "lavfi", "-i", "sine=frequency=300:duration=3", "-c:a", "pcm_s16le"]),
+        _ => ("sticker.png", "image/png",
+            vec!["-f", "lavfi", "-i", "color=c=red@0.0:size=400x400,format=rgba,drawbox=x=100:y=100:w=200:h=200:color=yellow@1:t=fill", "-frames:v", "1"]),
+    };
+    let out = dir.join(name);
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(&args)
+        .arg(&out)
+        .status()?;
+    anyhow::ensure!(status.success(), "ffmpeg failed");
+    let att = hub.media.register_local(&out, name, mime);
+    let _ = std::fs::remove_dir_all(&dir);
+    att
+}
+
 fn normalize_echo(raw: &str) -> String {
     apple::normalize_target(raw)
 }
@@ -124,7 +152,9 @@ fn normalize_echo(raw: &str) -> String {
 /// What the echo backend answers a sent message with. Text starting with a command makes the
 /// "other side" do something to the conversation instead of echoing:
 /// `/react N|emoji` (on the sent message), `/reply text`, `/edit text` and `/unsend` (on the
-/// last echo), `/rename name`, `/add handle`, `/remove handle`, `/icon`.
+/// last echo), `/rename name`, `/add handle`, `/remove handle`, `/icon`, `/photo`, `/video`,
+/// `/voice`, `/sticker`. `/group text` has the other side start a group with a third person;
+/// after that `/rename`, `/icon`, `/add`, `/remove` and `/gsay text` act on that group.
 #[allow(clippy::too_many_arguments)]
 fn echo_reply(
     hub: &Arc<Hub>,
@@ -135,9 +165,23 @@ fn echo_reply(
     attachments: &[body::OutAttachment],
     sent_id: &str,
     last_echo_id: &mut Option<String>,
+    echo_group: &mut Option<(Vec<String>, String)>,
+    me: &str,
 ) -> AppBody {
     let id = format!("echo-in-{}", Uuid::new_v4()).to_uppercase();
     let sender = normalize_echo(from);
+    let (participants, sender_guid) = {
+        let group_cmd = text.starts_with("/group")
+            || ["/rename", "/icon", "/add", "/remove", "/gsay"].iter().any(|c| text.starts_with(c));
+        if text.starts_with("/group") {
+            let members = vec![sender.clone(), "tel:+15553334444".to_string(), me.to_string()];
+            *echo_group = Some((members, format!("echo-group-{}", Uuid::new_v4())));
+        }
+        match echo_group.as_ref().filter(|_| group_cmd && participants.len() <= 2) {
+            Some((members, guid)) => (members.clone(), Some(guid.clone())),
+            None => (participants, sender_guid),
+        }
+    };
     let ts = now_epoch_ms();
     let (cmd, arg) = match text.strip_prefix('/') {
         Some(rest) => {
@@ -194,6 +238,25 @@ fn echo_reply(
                 }
             };
         }
+        "photo" | "video" | "voice" | "sticker" => {
+            // The other side sends media made with ffmpeg (tests incoming attachments).
+            match echo_media(hub, &cmd) {
+                Ok(att) => {
+                    *last_echo_id = Some(id.clone());
+                    return AppBody::IncomingMessage {
+                        apple_msg_id: id,
+                        sender,
+                        participants,
+                        sender_guid,
+                        timestamp_ms: ts,
+                        text: arg,
+                        reply_to: None,
+                        attachments: vec![att],
+                    };
+                }
+                Err(e) => warn!("[echo] can't make test {}: {:#}", cmd, e),
+            }
+        }
         "rename" => return group(body::GROUP_RENAMED, arg, Vec::new()),
         "icon" => return group(body::GROUP_ICON, "set".into(), Vec::new()),
         "add" | "remove" if !arg.is_empty() => {
@@ -206,12 +269,17 @@ fn echo_reply(
             if cmd == "add" {
                 members.push(who);
             }
+            if let Some(g) = echo_group.as_mut() {
+                g.0 = members.clone();
+            }
             return group(body::GROUP_PARTICIPANTS, String::new(), members);
         }
         _ => {}
     }
     let (text, reply_to) = if cmd == "reply" {
         (arg, Some(sent_id.to_string()))
+    } else if cmd == "group" || cmd == "gsay" {
+        (if arg.is_empty() { "hi everyone".to_string() } else { arg }, None)
     } else {
         (text.to_string(), None)
     };
@@ -252,6 +320,7 @@ async fn run_echo_backend(
     let mut relay_status_rx = relay.subscribe_status();
     let mut connect_rx = hub.subscribe_connects();
     let mut last_echo_id: Option<String> = None;
+    let mut echo_group: Option<(Vec<String>, String)> = None;
 
     loop {
         tokio::select! {
@@ -329,6 +398,8 @@ async fn run_echo_backend(
                             &attachments,
                             &send_id,
                             &mut last_echo_id,
+                            &mut echo_group,
+                            &handle,
                         );
                         echo_deliver(&hub, &msg.client_id, reply).await;
                     }
