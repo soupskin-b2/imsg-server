@@ -1,6 +1,7 @@
 mod apple;
 mod body;
 mod config;
+mod fairplay;
 mod pairing;
 mod proto;
 mod push;

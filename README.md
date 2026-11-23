@@ -37,28 +37,14 @@ sudo install -m 755 imsg-server /usr/local/bin/imsg-server
 ```sh
 git clone https://github.com/soupskin-b2/imsg-server
 cd imsg-server
-scripts/setup.sh            # fetches rustpush and installs FairPlay key files (see below)
+scripts/setup.sh            # fetches and patches rustpush
 cargo build --release       # needs Rust, protoc and a C toolchain
 sudo cp target/release/imsg-server /usr/local/bin/
 ```
 
-rustpush is a git submodule; this repository does not include its code. rustpush embeds FairPlay
-cert chains and keys at compile time to activate new devices with Apple (`albert.apple.com`).
-Albert rejects the public `legacy-fairplay` pair rustpush ships, so to activate a new device you
-must supply your own, in one of these ways (first match wins):
-
-1. `FAIRPLAY_CERTS_DIR=/path/to/dir scripts/setup.sh`
-2. `FAIRPLAY_CERTS_TGZ_B64` set to the base64 of a `.tar.gz` of that directory (the CI workflow
-   reads it from the repository secret of the same name)
-3. a `fairplay-certs/` directory in the checkout (gitignored)
-
-The directory holds `fairplay.crt` (chain: leaf, intermediates, Apple Root CA) and `fairplay.key`
-(its private key), or per-slot `<slot>.crt` / `<slot>.key` pairs, plus an optional `chain.crt` of
-intermediates to append. PEM and DER are both accepted; `scripts/fairplay_certs.py` converts
-them, checks that each key matches its leaf, verifies the chain and installs them. Without any of
-these, `setup.sh` falls back to `legacy-fairplay` with a warning: the build works, but only for
-devices activated before. The keys are compiled into the binary, so anyone with the binary can
-extract them; don't publish a build that contains keys you need to keep private.
+rustpush is a git submodule; this repository does not include its code. `scripts/setup.sh` applies
+`patches/rustpush-runtime-fairplay.patch`, which makes rustpush load its FairPlay certificates at
+runtime instead of compiling them in, so builds (including the published release) contain no keys.
 
 ## Set up
 
@@ -92,6 +78,13 @@ You can print the URL again at any time with `sudo imsg-server relay-url`. When 
 connects for the first time (or migrates from Beeper's relay), the built-in relay issues it a fresh
 code and secret automatically, `relayserver` saves them into `/var/mobile/config.json`, and
 `imsg-server` locks to that single provider.
+
+To activate a new device with Apple, `imsg-server` needs FairPlay certificates in
+`<apple_dir>/fairplay/` (by default `/var/lib/imsg-server/apple/fairplay/`). Put each certificate
+chain in `<name>.crt` (leaf first, then intermediates, ending at Apple Root CA; PEM or DER) with
+its private key beside it as `<name>.key` (PEM or DER), then restart. With several pairs, each
+activation picks one at random. They are loaded at startup, checked (key matches leaf, chain in
+order), and only used for activation: an install that is already activated runs without them.
 
 Next, pair the flip phone:
 

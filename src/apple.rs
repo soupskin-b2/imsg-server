@@ -466,6 +466,7 @@ pub async fn run_apple(
     mut incoming_rx: mpsc::Receiver<IncomingClientMsg>,
 ) -> Result<()> {
     init_software_keystore(&cfg.apple_dir)?;
+    crate::fairplay::install(&crate::fairplay::dir(&cfg.apple_dir))?;
     if cfg.apple_dir.join("id.plist").exists() {
         return run_bridge(cfg, hub, relay, internal_relay, incoming_rx).await;
     }
@@ -759,6 +760,12 @@ async fn activate(cfg: &Config, internal_relay: &(String, String)) -> Result<Act
             .map_err(|e| anyhow!("failed to restore IDSNGMIdentity: {}", e))?;
         (hw.relay, identity, Some(hw.push))
     } else {
+        if crate::fairplay::loaded() == 0 {
+            bail!(
+                "No FairPlay certs loaded; put a .crt chain + .key pair in {} and restart to activate a new device",
+                crate::fairplay::dir(&cfg.apple_dir).display()
+            );
+        }
         info!("activating a new device through built-in registration relay");
         let version = RelayConfig::get_versions(&internal_relay.0, &internal_relay.1, &None)
             .await

@@ -1,0 +1,64 @@
+diff --git a/src/activation.rs b/src/activation.rs
+index d9b2d36..bb3c5d2 100644
+--- a/src/activation.rs
++++ b/src/activation.rs
+@@ -35,33 +35,27 @@ struct ActivationRequest {
+     fair_play_signature: Data
+ }
+ 
+-macro_rules! include_cert {
+-    ($name:literal) => {
+-        (include_bytes!(concat!("../certs/fairplay/", $name, ".crt")), include_bytes!(concat!("../certs/fairplay/", $name, ".pem")))
+-    };
++/// FairPlay (DER certificate chain, DER private key) pairs used to sign Albert activations,
++/// loaded at runtime with [`set_fairplay_keys`] instead of embedded at compile time.
++static FAIRPLAY_KEYS: std::sync::OnceLock<Vec<(Vec<u8>, Vec<u8>)>> = std::sync::OnceLock::new();
++
++/// Sets the FairPlay (DER certificate chain leaf first, DER private key) pairs. Must be called
++/// before activating a new device. Returns false if keys were already set.
++pub fn set_fairplay_keys(keys: Vec<(Vec<u8>, Vec<u8>)>) -> bool {
++    FAIRPLAY_KEYS.set(keys).is_ok()
+ }
+ 
+-const FAIRPLAY_KEYS: &[(&'static [u8], &'static [u8])] = &[
+-    include_cert!("4056631661436364584235346952193"),
+-    include_cert!("4056631661436364584235346952194"),
+-    include_cert!("4056631661436364584235346952195"),
+-    include_cert!("4056631661436364584235346952196"),
+-    include_cert!("4056631661436364584235346952197"),
+-    include_cert!("4056631661436364584235346952198"),
+-    include_cert!("4056631661436364584235346952199"),
+-    include_cert!("4056631661436364584235346952200"),
+-    include_cert!("4056631661436364584235346952201"),
+-    include_cert!("4056631661436364584235346952208"),
+-];
+-
+ fn fairplay_sign(data: &[u8]) -> Result<(&'static [u8], Vec<u8>), PushError> {
+-    let (cert, key) = FAIRPLAY_KEYS.choose(&mut thread_rng()).expect("no keys!");
++    let (cert, key) = FAIRPLAY_KEYS
++        .get()
++        .and_then(|keys| keys.choose(&mut thread_rng()))
++        .ok_or_else(|| PushError::IoError(std::io::Error::new(std::io::ErrorKind::NotFound, "no FairPlay certificates loaded")))?;
+ 
+-    let key = PKey::private_key_from_der(&key)?;
++    let key = PKey::private_key_from_der(key)?;
+ 
+     let mut signer = Signer::new(MessageDigest::sha1(), &key)?;
+     signer.set_rsa_padding(Padding::PKCS1)?;
+-    Ok((*cert, signer.sign_oneshot_to_vec(data)?))
++    Ok((cert.as_slice(), signer.sign_oneshot_to_vec(data)?))
+ }
+ 
+ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, PushError> {
+diff --git a/src/lib.rs b/src/lib.rs
+index c71234a..c429246 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -39,6 +39,7 @@ pub use icloud_auth::{DefaultAnisetteProvider, GenerateVerificationTokenRequest,
+ 
+ pub use util::{DebugRwLock, DebugMutex};
+ use activation::ActivationInfo;
++pub use activation::set_fairplay_keys;
+ pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
+ use async_trait::async_trait;
+ pub use auth::{request_update_account, UpdateAccountFinish};

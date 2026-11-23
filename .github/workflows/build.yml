@@ -20,11 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Fetch rustpush and set up FairPlay key files
-        env:
-          # Optional: base64 of a .tar.gz of FairPlay certs (see scripts/setup.sh). Without it the
-          # build uses rustpush's public legacy-fairplay pair, which Albert rejects.
-          FAIRPLAY_CERTS_TGZ_B64: ${{ secrets.FAIRPLAY_CERTS_TGZ_B64 }}
+      - name: Fetch and patch rustpush
         run: scripts/setup.sh
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
