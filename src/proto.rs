@@ -369,9 +369,18 @@ impl Frame {
     }
 }
 
+/// Largest frame accepted before a connection has authenticated (HELLO) and on probe
+/// connections (PING/BYE): a stranger must not make the server allocate MAX_PAYLOAD_LEN.
+pub const MAX_HANDSHAKE_PAYLOAD_LEN: usize = 1024;
+
 /// Reads a single frame from an AsyncRead stream. Returns Ok(None) on clean EOF at frame boundary.
 /// Note: NOT cancel-safe; always run in a dedicated reader task.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Frame>> {
+    read_frame_max(reader, MAX_PAYLOAD_LEN).await
+}
+
+/// Like [`read_frame`], refusing frames whose payload is longer than `max`.
+pub async fn read_frame_max<R: AsyncRead + Unpin>(reader: &mut R, max: usize) -> Result<Option<Frame>> {
     let mut header = [0u8; HEADER_LEN];
     match reader.read(&mut header[0..1]).await {
         Ok(0) => return Ok(None),
@@ -382,8 +391,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<F
     reader.read_exact(&mut header[1..HEADER_LEN]).await?;
     let frame_type = header[0];
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > MAX_PAYLOAD_LEN {
-        bail!("frame payload length {} exceeds {}", len, MAX_PAYLOAD_LEN);
+    if len > max {
+        bail!("frame payload length {} exceeds {}", len, max);
     }
     let mut payload = vec![0u8; len];
     if len > 0 {
@@ -468,6 +477,25 @@ mod tests {
             assert_eq!(&decoded, expected);
         }
         assert!(read_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn handshake_limit_rejects_big_frames_before_allocating() {
+        let mut buf = vec![FRAME_HELLO];
+        buf.extend_from_slice(&(MAX_PAYLOAD_LEN as u32).to_be_bytes());
+        let mut cursor = &buf[..];
+        assert!(read_frame_max(&mut cursor, MAX_HANDSHAKE_PAYLOAD_LEN).await.is_err());
+        let hello = Frame::Hello {
+            version: PROTOCOL_VERSION,
+            role: ROLE_MAIN,
+            token: vec![b'a'; 64],
+            last_rx_seq: 0,
+            interval_s: 60,
+        }
+        .encode()
+        .unwrap();
+        let mut cursor = &hello[..];
+        assert!(read_frame_max(&mut cursor, MAX_HANDSHAKE_PAYLOAD_LEN).await.unwrap().is_some());
     }
 
     #[tokio::test]

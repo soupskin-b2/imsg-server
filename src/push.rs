@@ -1,9 +1,9 @@
 use crate::config::{Config, WakeupConfig};
 use crate::proto::{
-    bye_reason_name, read_frame, write_frame, Frame, ACK_TIMEOUT_S, BYE_AUTH_FAILED,
+    bye_reason_name, read_frame, read_frame_max, write_frame, Frame, ACK_TIMEOUT_S, BYE_AUTH_FAILED,
     BYE_BAD_VERSION, BYE_PROTOCOL_ERROR, BYE_REPLACED, BYE_SERVER_SHUTDOWN, FALLBACK_INTERVAL_S,
     FRAME_HELLO, MEDIA_CHUNK_LEN, PONG_TIMEOUT_S, PROBE_SERVER_IDLE_S, PROTOCOL_VERSION, ROLE_MAIN,
-    ROLE_MEDIA, ROLE_PAIR, ROLE_PROBE,
+    ROLE_MEDIA, ROLE_PAIR, ROLE_PROBE, MAX_HANDSHAKE_PAYLOAD_LEN,
 };
 use crate::media::MediaStore;
 use crate::relay::RelayHub;
@@ -584,7 +584,7 @@ where
 {
     let first = tokio::time::timeout(
         Duration::from_secs(HANDSHAKE_TIMEOUT_S),
-        read_frame(&mut stream),
+        read_frame_max(&mut stream, MAX_HANDSHAKE_PAYLOAD_LEN),
     )
     .await
     .map_err(|_| anyhow!("HELLO timed out"))??;
@@ -670,7 +670,7 @@ where
 
     let idle_limit = Duration::from_secs(PROBE_SERVER_IDLE_S);
     loop {
-        let next = match tokio::time::timeout(idle_limit, read_frame(&mut stream)).await {
+        let next = match tokio::time::timeout(idle_limit, read_frame_max(&mut stream, MAX_HANDSHAKE_PAYLOAD_LEN)).await {
             Ok(Ok(Some(frame))) => frame,
             Ok(Ok(None)) => {
                 debug!("client '{}' probe {} EOF", client_id, peer);
