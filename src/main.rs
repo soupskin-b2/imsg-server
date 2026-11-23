@@ -2,6 +2,7 @@ mod apple;
 mod body;
 mod config;
 mod fairplay;
+mod media;
 mod pairing;
 mod proto;
 mod push;
@@ -116,6 +117,129 @@ fn echo_reg_info(
 }
 
 /// Test backend. Simulates phone-number setup (any REG-RESP is accepted), then echoes messages.
+fn normalize_echo(raw: &str) -> String {
+    apple::normalize_target(raw)
+}
+
+/// What the echo backend answers a sent message with. Text starting with a command makes the
+/// "other side" do something to the conversation instead of echoing:
+/// `/react N|emoji` (on the sent message), `/reply text`, `/edit text` and `/unsend` (on the
+/// last echo), `/rename name`, `/add handle`, `/remove handle`, `/icon`.
+#[allow(clippy::too_many_arguments)]
+fn echo_reply(
+    hub: &Arc<Hub>,
+    from: &str,
+    participants: Vec<String>,
+    sender_guid: Option<String>,
+    text: &str,
+    attachments: &[body::OutAttachment],
+    sent_id: &str,
+    last_echo_id: &mut Option<String>,
+) -> AppBody {
+    let id = format!("echo-in-{}", Uuid::new_v4()).to_uppercase();
+    let sender = normalize_echo(from);
+    let ts = now_epoch_ms();
+    let (cmd, arg) = match text.strip_prefix('/') {
+        Some(rest) => {
+            let (c, a) = rest.split_once(' ').unwrap_or((rest, ""));
+            (c.to_ascii_lowercase(), a.trim().to_string())
+        }
+        None => (String::new(), String::new()),
+    };
+    let group = |event: u8, name: String, new_participants: Vec<String>| AppBody::GroupEvent {
+        apple_msg_id: id.clone(),
+        sender: sender.clone(),
+        participants: participants.clone(),
+        sender_guid: sender_guid.clone(),
+        timestamp_ms: ts,
+        event,
+        name,
+        new_participants,
+    };
+    match cmd.as_str() {
+        "react" => {
+            let (reaction, emoji) = match arg.parse::<u8>() {
+                Ok(n) if n <= body::REACT_QUESTION => (n, None),
+                _ if !arg.is_empty() => (body::REACT_EMOJI, Some(arg.clone())),
+                _ => (body::REACT_HEART, None),
+            };
+            return AppBody::Reaction {
+                apple_msg_id: id,
+                sender,
+                participants,
+                sender_guid,
+                timestamp_ms: ts,
+                target_id: sent_id.to_string(),
+                reaction,
+                emoji,
+                enable: true,
+            };
+        }
+        "edit" | "unsend" if last_echo_id.is_some() => {
+            let target_id = last_echo_id.clone().unwrap_or_default();
+            return if cmd == "edit" {
+                AppBody::Edit {
+                    apple_msg_id: id,
+                    sender,
+                    timestamp_ms: ts,
+                    target_id,
+                    text: arg,
+                }
+            } else {
+                AppBody::Unsend {
+                    apple_msg_id: id,
+                    sender,
+                    timestamp_ms: ts,
+                    target_id,
+                }
+            };
+        }
+        "rename" => return group(body::GROUP_RENAMED, arg, Vec::new()),
+        "icon" => return group(body::GROUP_ICON, "set".into(), Vec::new()),
+        "add" | "remove" if !arg.is_empty() => {
+            let who = normalize_echo(&arg);
+            let mut members: Vec<String> = participants
+                .iter()
+                .filter(|p| !p.eq_ignore_ascii_case(&who))
+                .cloned()
+                .collect();
+            if cmd == "add" {
+                members.push(who);
+            }
+            return group(body::GROUP_PARTICIPANTS, String::new(), members);
+        }
+        _ => {}
+    }
+    let (text, reply_to) = if cmd == "reply" {
+        (arg, Some(sent_id.to_string()))
+    } else {
+        (text.to_string(), None)
+    };
+    let mut echoed = Vec::new();
+    for a in attachments {
+        match hub
+            .media
+            .upload_path(&a.upload_id)
+            .and_then(|p| hub.media.register_local(&p, &a.name, &a.mime))
+        {
+            Ok(att) => echoed.push(att),
+            Err(e) => warn!("[echo] can't echo attachment {}: {:#}", a.upload_id, e),
+        }
+        hub.media.remove_upload(&a.upload_id);
+    }
+    *last_echo_id = Some(id.clone());
+    AppBody::IncomingMessage {
+        apple_msg_id: id,
+        sender,
+        participants,
+        sender_guid,
+        timestamp_ms: ts,
+        text,
+        reply_to,
+        attachments: echoed,
+    }
+}
+
 async fn run_echo_backend(
     cfg: Config,
     hub: Arc<Hub>,
@@ -127,6 +251,7 @@ async fn run_echo_backend(
     let mut fake_expires_ms: u64 = 0;
     let mut relay_status_rx = relay.subscribe_status();
     let mut connect_rx = hub.subscribe_connects();
+    let mut last_echo_id: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -162,7 +287,7 @@ async fn run_echo_backend(
                         );
                         echo_deliver(&hub, &msg.client_id, info).await;
                     }
-                    Ok(AppBody::SendText { client_msg_id, .. } | AppBody::SendGroupText { client_msg_id, .. })
+                    Ok(AppBody::SendMessage { client_msg_id, .. } | AppBody::SendReaction { client_msg_id, .. })
                         if handle.is_empty() =>
                     {
                         let reply = AppBody::SendResult {
@@ -173,34 +298,78 @@ async fn run_echo_backend(
                         };
                         echo_deliver(&hub, &msg.client_id, reply).await;
                     }
-                    Ok(AppBody::SendText {
+                    Ok(AppBody::SendMessage {
                         client_msg_id,
-                        target,
-                        text,
+                        participants,
                         sender_guid,
+                        text,
+                        attachments,
                     }) => {
                         info!(
-                            "[echo] client '{}' seq={} SEND_TEXT id='{}' target='{}' text={:?}",
-                            msg.client_id, msg.seq, client_msg_id, target, text
+                            "[echo] client '{}' seq={} SEND_MESSAGE id='{}' to={:?} text={:?} attachments={}",
+                            msg.client_id, msg.seq, client_msg_id, participants, text, attachments.len()
                         );
-                        let send_id = format!("echo-{}", Uuid::new_v4());
+                        let send_id = format!("echo-{}", Uuid::new_v4()).to_uppercase();
                         let res_body = AppBody::SendResult {
                             client_msg_id,
                             ok: true,
-                            apple_msg_id: Some(send_id),
+                            apple_msg_id: Some(send_id.clone()),
                             error: None,
                         };
                         echo_deliver(&hub, &msg.client_id, res_body).await;
-
-                        let echo_in = AppBody::IncomingText {
-                            apple_msg_id: format!("echo-in-{}", Uuid::new_v4()),
-                            sender: target.clone(),
-                            participants: vec![target, handle.clone()],
+                        let Some(first) = participants.first().cloned() else { continue };
+                        let mut all = participants.clone();
+                        all.push(handle.clone());
+                        let reply = echo_reply(
+                            &hub,
+                            &first,
+                            all,
                             sender_guid,
-                            timestamp_ms: now_epoch_ms(),
-                            text,
+                            &text,
+                            &attachments,
+                            &send_id,
+                            &mut last_echo_id,
+                        );
+                        echo_deliver(&hub, &msg.client_id, reply).await;
+                    }
+                    Ok(AppBody::SendReaction {
+                        client_msg_id,
+                        participants,
+                        sender_guid,
+                        target_id,
+                        reaction,
+                        emoji,
+                        enable,
+                        ..
+                    }) => {
+                        info!(
+                            "[echo] client '{}' SEND_REACTION kind={} emoji={:?} enable={} on={}",
+                            msg.client_id, reaction, emoji, enable, target_id
+                        );
+                        let res_body = AppBody::SendResult {
+                            client_msg_id,
+                            ok: true,
+                            apple_msg_id: Some(format!("echo-r-{}", Uuid::new_v4()).to_uppercase()),
+                            error: None,
                         };
-                        echo_deliver(&hub, &msg.client_id, echo_in).await;
+                        echo_deliver(&hub, &msg.client_id, res_body).await;
+                        // The other side reacts the same way.
+                        if let Some(first) = participants.first().cloned() {
+                            let mut all = participants;
+                            all.push(handle.clone());
+                            let back = AppBody::Reaction {
+                                apple_msg_id: format!("echo-r-in-{}", Uuid::new_v4()).to_uppercase(),
+                                sender: normalize_echo(&first),
+                                participants: all,
+                                sender_guid,
+                                timestamp_ms: now_epoch_ms(),
+                                target_id,
+                                reaction,
+                                emoji,
+                                enable,
+                            };
+                            echo_deliver(&hub, &msg.client_id, back).await;
+                        }
                     }
                     Ok(AppBody::GetHandles) => {
                         info!("[echo] client '{}' seq={} GET_HANDLES", msg.client_id, msg.seq);
@@ -277,38 +446,6 @@ async fn run_echo_backend(
                             unregistered,
                         };
                         echo_deliver(&hub, &msg.client_id, reply).await;
-                    }
-                    Ok(AppBody::SendGroupText {
-                        client_msg_id,
-                        participants,
-                        text,
-                        sender_guid,
-                    }) => {
-                        info!(
-                            "[echo] client '{}' seq={} SEND_GROUP_TEXT id='{}' participants={:?} text={:?}",
-                            msg.client_id, msg.seq, client_msg_id, participants, text
-                        );
-                        let send_id = format!("echo-grp-{}", Uuid::new_v4());
-                        let res_body = AppBody::SendResult {
-                            client_msg_id,
-                            ok: true,
-                            apple_msg_id: Some(send_id),
-                            error: None,
-                        };
-                        echo_deliver(&hub, &msg.client_id, res_body).await;
-                        if let Some(first) = participants.first().cloned() {
-                            let mut all = participants;
-                            all.push(handle.clone());
-                            let echo_in = AppBody::IncomingText {
-                                apple_msg_id: format!("echo-grp-in-{}", Uuid::new_v4()),
-                                sender: first,
-                                participants: all,
-                                sender_guid,
-                                timestamp_ms: now_epoch_ms(),
-                                text,
-                            };
-                            echo_deliver(&hub, &msg.client_id, echo_in).await;
-                        }
                     }
                     Ok(other) => {
                         warn!(

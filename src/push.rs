@@ -2,9 +2,10 @@ use crate::config::{Config, WakeupConfig};
 use crate::proto::{
     bye_reason_name, read_frame, write_frame, Frame, ACK_TIMEOUT_S, BYE_AUTH_FAILED,
     BYE_BAD_VERSION, BYE_PROTOCOL_ERROR, BYE_REPLACED, BYE_SERVER_SHUTDOWN, FALLBACK_INTERVAL_S,
-    FRAME_HELLO, PONG_TIMEOUT_S, PROBE_SERVER_IDLE_S, PROTOCOL_VERSION, ROLE_MAIN, ROLE_PAIR,
-    ROLE_PROBE,
+    FRAME_HELLO, MEDIA_CHUNK_LEN, PONG_TIMEOUT_S, PROBE_SERVER_IDLE_S, PROTOCOL_VERSION, ROLE_MAIN,
+    ROLE_MEDIA, ROLE_PAIR, ROLE_PROBE,
 };
+use crate::media::MediaStore;
 use crate::relay::RelayHub;
 use crate::state::ClientState;
 use anyhow::{anyhow, Context, Result};
@@ -68,6 +69,7 @@ pub struct Hub {
     wakeup: Option<WakeupConfig>,
     connect_tx: broadcast::Sender<String>,
     inner: Mutex<HubInner>,
+    pub media: Arc<MediaStore>,
 }
 
 struct MainRegistration {
@@ -93,7 +95,13 @@ impl Hub {
             );
         }
         let (connect_tx, _) = broadcast::channel(64);
+        let media = Arc::new(MediaStore::new(
+            &cfg.state_dir,
+            cfg.media.ffmpeg.as_deref(),
+            cfg.media.retention_days,
+        )?);
         Ok(Self {
+            media,
             state_dir: cfg.state_dir.clone(),
             config_path: cfg.path.clone(),
             auth_entries: Mutex::new(auth_entries),
@@ -635,6 +643,10 @@ where
             debug!("client '{}' probe connected from {}", client_id, peer);
             handle_probe(stream, &client_id, peer).await
         }
+        ROLE_MEDIA => {
+            debug!("client '{}' media connection from {}", client_id, peer);
+            handle_media(stream, &client_id, Arc::clone(&hub.media)).await
+        }
         ROLE_MAIN => {
             info!(
                 "client '{}' main connected from {} (last_rx_seq={}, interval_s={})",
@@ -701,6 +713,139 @@ where
         }
     }
     Ok(())
+}
+
+/// How long a media connection may sit idle between requests.
+const MEDIA_IDLE_S: u64 = 120;
+
+struct UploadInProgress {
+    id: String,
+    total: u64,
+    received: u64,
+    tmp: PathBuf,
+    file: tokio::fs::File,
+}
+
+/// ROLE_MEDIA: serves MEDIA_GET downloads and MEDIA_PUT uploads, one request at a time.
+async fn handle_media<S>(mut stream: S, client_id: &str, media: Arc<MediaStore>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    write_frame(&mut stream, &Frame::Welcome { last_rx_seq: 0 }).await?;
+    let mut upload: Option<UploadInProgress> = None;
+    let result: Result<()> = async {
+        loop {
+            let frame = match tokio::time::timeout(
+                Duration::from_secs(MEDIA_IDLE_S),
+                read_frame(&mut stream),
+            )
+            .await
+            {
+                Ok(Ok(Some(f))) => f,
+                Ok(Ok(None)) | Err(_) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+            };
+            match frame {
+                Frame::MediaGet { id, full, offset } => {
+                    let variant = match media.variant(&id, full).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("client '{}' MEDIA_GET {} (full={}) failed: {:#}", client_id, id, full, e);
+                            write_frame(&mut stream, &Frame::MediaErr { message: format!("{:#}", e) }).await?;
+                            continue;
+                        }
+                    };
+                    let mut file = tokio::fs::File::open(&variant.path).await?;
+                    let mut pos = offset.min(variant.len);
+                    file.seek(std::io::SeekFrom::Start(pos)).await?;
+                    let mut buf = vec![0u8; MEDIA_CHUNK_LEN];
+                    loop {
+                        let want = ((variant.len - pos) as usize).min(MEDIA_CHUNK_LEN);
+                        file.read_exact(&mut buf[..want]).await?;
+                        write_frame(
+                            &mut stream,
+                            &Frame::MediaData {
+                                total: variant.len,
+                                offset: pos,
+                                mime: variant.mime.clone(),
+                                name: variant.name.clone(),
+                                data: buf[..want].to_vec(),
+                            },
+                        )
+                        .await?;
+                        pos += want as u64;
+                        if pos >= variant.len {
+                            break;
+                        }
+                    }
+                    debug!(
+                        "client '{}' fetched {} (full={}, {} bytes from {})",
+                        client_id, id, full, variant.len, offset
+                    );
+                }
+                Frame::MediaPut { id, offset, total, data } => {
+                    let err = |m: String| Frame::MediaErr { message: m };
+                    if total > media.max_upload_bytes() {
+                        write_frame(&mut stream, &err("attachment is too large".into())).await?;
+                        continue;
+                    }
+                    if offset == 0 {
+                        if let Some(old) = upload.take() {
+                            let _ = tokio::fs::remove_file(&old.tmp).await;
+                        }
+                        let path = match media.upload_path(&id) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                write_frame(&mut stream, &err(format!("{:#}", e))).await?;
+                                continue;
+                            }
+                        };
+                        let tmp = path.with_extension("part");
+                        let file = tokio::fs::File::create(&tmp).await?;
+                        upload = Some(UploadInProgress { id: id.clone(), total, received: 0, tmp, file });
+                    }
+                    let Some(up) = upload.as_mut().filter(|u| u.id == id && u.received == offset && u.total == total) else {
+                        write_frame(&mut stream, &err("upload out of order; start again".into())).await?;
+                        continue;
+                    };
+                    if up.received + data.len() as u64 > total {
+                        let _ = tokio::fs::remove_file(&up.tmp).await;
+                        upload = None;
+                        write_frame(&mut stream, &err("upload longer than announced".into())).await?;
+                        continue;
+                    }
+                    up.file.write_all(&data).await?;
+                    up.received += data.len() as u64;
+                    if up.received == total {
+                        let up = upload.take().expect("upload present");
+                        let mut file = up.file;
+                        file.flush().await?;
+                        file.sync_all().await?;
+                        drop(file);
+                        tokio::fs::rename(&up.tmp, media.upload_path(&up.id)?).await?;
+                        info!("client '{}' uploaded {} ({} bytes)", client_id, up.id, total);
+                        write_frame(&mut stream, &Frame::MediaPutAck { id: up.id, received: total }).await?;
+                    }
+                }
+                Frame::Ping { nonce } => {
+                    write_frame(&mut stream, &Frame::Pong { nonce }).await?;
+                }
+                Frame::Bye { .. } => return Ok(()),
+                other => {
+                    warn!("client '{}' media connection sent unexpected frame {:?}", client_id, other.frame_type());
+                    let _ = write_frame(&mut stream, &Frame::Bye { reason: BYE_PROTOCOL_ERROR }).await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    .await;
+    if let Some(up) = upload {
+        let _ = tokio::fs::remove_file(&up.tmp).await;
+    }
+    result
 }
 
 fn idle_timeout_for(interval_s: u16) -> Duration {

@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub renewal: RenewalConfig,
     #[serde(default)]
+    pub media: MediaConfig,
+    #[serde(default)]
     pub clients: Vec<ClientConfig>,
     /// Where this config was loaded from (paired phones are appended here).
     #[serde(skip)]
@@ -64,6 +66,30 @@ impl Default for RenewalConfig {
 
 fn default_renewal_lead_days() -> u64 {
     7
+}
+
+/// Attachment handling (`[media]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaConfig {
+    /// ffmpeg to convert photos, videos and audio with (ffprobe is looked up next to it).
+    #[serde(default)]
+    pub ffmpeg: Option<String>,
+    /// Keep downloaded attachments this many days, so the phone can save the full-size file.
+    #[serde(default = "default_media_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            ffmpeg: None,
+            retention_days: default_media_retention_days(),
+        }
+    }
+}
+
+fn default_media_retention_days() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

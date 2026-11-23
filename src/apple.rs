@@ -1,8 +1,12 @@
 use crate::body::{
-    AppBody, RECEIPT_DELIVERED, RECEIPT_READ, REG_STATE_FAILED, REG_STATE_NEEDS_PHONE,
-    REG_STATE_OK, REG_STATE_RENEWING, SETUP_FAILED, SETUP_NEED_SIM, SETUP_READY,
-    SETUP_WAITING_SMS, SETUP_WORKING,
+    AppBody, InAttachment, OutAttachment, ATTACH_AUDIO, ATTACH_FILE, ATTACH_IMAGE, ATTACH_STICKER,
+    ATTACH_VCARD, ATTACH_VIDEO, ATTACH_VOICE, GROUP_ICON, GROUP_PARTICIPANTS, GROUP_RENAMED,
+    REACT_DISLIKE, REACT_EMOJI, REACT_EMPHASIZE, REACT_HEART, REACT_LAUGH, REACT_LIKE,
+    REACT_QUESTION, REACT_STICKER, RECEIPT_DELIVERED, RECEIPT_READ, REG_STATE_FAILED,
+    REG_STATE_NEEDS_PHONE, REG_STATE_OK, REG_STATE_RENEWING, SETUP_FAILED, SETUP_NEED_SIM,
+    SETUP_READY, SETUP_WAITING_SMS, SETUP_WORKING,
 };
+use crate::media::{self, MediaStore};
 use crate::config::Config;
 use crate::push::{Hub, IncomingClientMsg};
 use crate::relay::{RelayHub, RelayStatus};
@@ -16,9 +20,10 @@ use plist::Data;
 use rand::RngCore;
 use rustpush::{
     authenticate_phone, get_gateways_for_mccmnc, register, APSConnection, APSConnectionResource,
-    APSState, AuthPhone, ConversationData, IDSNGMIdentity, IDSUser, IMClient, Message,
-    MessageInst, MessageType, NormalMessage, OSConfig, PushError, RelayConfig, ResourceFailure,
-    ResourceState, MADRID_SERVICE,
+    APSState, Attachment, AuthPhone, BalloonLayout, ConversationData, ExtensionApp, IDSNGMIdentity,
+    IDSUser, IMClient, IndexedMessagePart, MMCSFile, Message, MessageInst, MessagePart,
+    MessageParts, MessageType, NormalMessage, OSConfig, PushError, Reaction, ReactMessage,
+    ReactMessageType, RelayConfig, ResourceFailure, ResourceState, MADRID_SERVICE,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -566,8 +571,8 @@ pub async fn run_apple(
                             }
                         }
                     }
-                    AppBody::SendText { client_msg_id, .. }
-                    | AppBody::SendGroupText { client_msg_id, .. } => {
+                    AppBody::SendMessage { client_msg_id, .. }
+                    | AppBody::SendReaction { client_msg_id, .. } => {
                         let reply = AppBody::SendResult {
                             client_msg_id,
                             ok: false,
@@ -955,6 +960,7 @@ async fn bridge_loop(
         );
     }
     status.save_and_broadcast(&hub).await;
+    hub.media.set_aps(conn.clone());
 
     loop {
         let outcome = bridge_session(
@@ -1031,6 +1037,7 @@ async fn bridge_session(
     let rx_client = Arc::clone(&im_client);
     let rx_hub = Arc::clone(hub);
     let rx_preferred = cfg.preferred_handle.clone();
+    let rx_media = Arc::clone(&hub.media);
     let recv_task = tokio::spawn(async move {
         loop {
             let aps_msg = match aps_rx.recv().await {
@@ -1060,98 +1067,151 @@ async fn bridge_session(
                 now_epoch_ms()
             };
             let sender = inst.sender.clone().unwrap_or_default();
+            let (participants, sender_guid) = match &inst.conversation {
+                Some(conv) => (conv.participants.clone(), conv.sender_guid.clone()),
+                None => (Vec::new(), None),
+            };
+            let is_normal = matches!(inst.message, Message::Message(_));
+            let group_event = |event: u8, name: String, new_participants: Vec<String>| {
+                AppBody::GroupEvent {
+                    apple_msg_id: inst.id.clone(),
+                    sender: sender.clone(),
+                    participants: participants.clone(),
+                    sender_guid: sender_guid.clone(),
+                    timestamp_ms: ts_ms,
+                    event,
+                    name,
+                    new_participants,
+                }
+            };
 
-            match inst.message {
+            let body = match &inst.message {
                 Message::Message(nm) => {
-                    let text = nm.parts.raw_text();
-                    let (participants, sender_guid) = match &inst.conversation {
-                        Some(conv) => (conv.participants.clone(), conv.sender_guid.clone()),
-                        None => (Vec::new(), None),
-                    };
-
+                    let (text, attachments) = render_message(nm, &rx_media);
                     info!(
-                        "[apple->client] INCOMING_TEXT id={} from={} text_len={}",
+                        "[apple->client] INCOMING id={} from={} text_len={} attachments={}",
                         inst.id,
                         sender,
-                        text.len()
+                        text.len(),
+                        attachments.len()
                     );
-
-                    let body = AppBody::IncomingText {
+                    Some(AppBody::IncomingMessage {
                         apple_msg_id: inst.id.clone(),
                         sender: sender.clone(),
-                        participants,
+                        participants: participants.clone(),
                         sender_guid: sender_guid.clone(),
                         timestamp_ms: ts_ms,
                         text,
-                    };
-
-                    // Persist to client outbox(es) BEFORE certifying delivery to Apple.
-                    match body.encode() {
-                        Ok(encoded) => {
-                            let _ = rx_hub.deliver_all(encoded).await;
-                        }
-                        Err(e) => {
-                            warn!("failed to encode INCOMING_TEXT: {:#}", e);
-                            continue;
-                        }
-                    }
-
-                    // Certify or send delivery receipt after outbox persistence.
-                    if let Some(ctx) = inst.certified_context {
-                        if let Err(e) = rx_client
-                            .identity
-                            .certify_delivery("com.apple.madrid", &ctx, inst.send_delivered)
-                            .await
-                        {
-                            warn!("certify_delivery failed for {}: {}", inst.id, e);
-                        }
-                    } else if inst.send_delivered && !sender.is_empty() {
-                        let my_handles = rx_client.identity.get_handles().await;
-                        if let Some(me) =
-                            pick_sender_handle(&my_handles, rx_preferred.as_deref())
-                        {
-                            let mut delivered = MessageInst::new(
-                                ConversationData {
-                                    participants: vec![sender.clone()],
-                                    cv_name: None,
-                                    sender_guid,
-                                    after_guid: None,
-                                },
-                                &me,
-                                Message::Delivered,
-                            );
-                            delivered.id = inst.id.clone();
-                            delivered.target = inst.target;
-                            if let Err(e) = rx_client.send(&mut delivered).await {
-                                warn!("failed to send Message::Delivered for {}: {}", inst.id, e);
-                            }
-                        }
-                    }
+                        reply_to: nm.reply_guid.clone(),
+                        attachments,
+                    })
                 }
-                Message::Delivered => {
-                    let body = AppBody::Receipt {
-                        kind: RECEIPT_DELIVERED,
-                        apple_msg_id: inst.id,
-                        sender,
+                Message::React(r) => reaction_code(r).map(|(reaction, emoji, enable)| {
+                    info!(
+                        "[apple->client] REACTION {} from={} on={} kind={} enable={}",
+                        inst.id, sender, r.to_uuid, reaction, enable
+                    );
+                    AppBody::Reaction {
+                        apple_msg_id: inst.id.clone(),
+                        sender: sender.clone(),
+                        participants: participants.clone(),
+                        sender_guid: sender_guid.clone(),
                         timestamp_ms: ts_ms,
-                    };
-                    if let Ok(encoded) = body.encode() {
-                        let _ = rx_hub.deliver_all(encoded).await;
+                        target_id: r.to_uuid.clone(),
+                        reaction,
+                        emoji,
+                        enable,
                     }
-                }
-                Message::Read => {
-                    let body = AppBody::Receipt {
-                        kind: RECEIPT_READ,
-                        apple_msg_id: inst.id,
-                        sender,
+                }),
+                Message::Edit(e) => {
+                    info!("[apple->client] EDIT {} from={} on={}", inst.id, sender, e.tuuid);
+                    Some(AppBody::Edit {
+                        apple_msg_id: inst.id.clone(),
+                        sender: sender.clone(),
                         timestamp_ms: ts_ms,
-                    };
-                    if let Ok(encoded) = body.encode() {
-                        let _ = rx_hub.deliver_all(encoded).await;
-                    }
+                        target_id: e.tuuid.clone(),
+                        text: parts_text(&e.new_parts, None),
+                    })
                 }
+                Message::Unsend(u) => {
+                    info!("[apple->client] UNSEND {} from={} on={}", inst.id, sender, u.tuuid);
+                    Some(AppBody::Unsend {
+                        apple_msg_id: inst.id.clone(),
+                        sender: sender.clone(),
+                        timestamp_ms: ts_ms,
+                        target_id: u.tuuid.clone(),
+                    })
+                }
+                Message::RenameMessage(r) => {
+                    Some(group_event(GROUP_RENAMED, r.new_name.clone(), Vec::new()))
+                }
+                Message::ChangeParticipants(c) => Some(group_event(
+                    GROUP_PARTICIPANTS,
+                    String::new(),
+                    c.new_participants.clone(),
+                )),
+                Message::IconChange(i) => Some(group_event(
+                    GROUP_ICON,
+                    if i.file.is_some() { "set".to_string() } else { String::new() },
+                    Vec::new(),
+                )),
+                Message::Delivered => Some(AppBody::Receipt {
+                    kind: RECEIPT_DELIVERED,
+                    apple_msg_id: inst.id.clone(),
+                    sender: sender.clone(),
+                    timestamp_ms: ts_ms,
+                }),
+                Message::Read => Some(AppBody::Receipt {
+                    kind: RECEIPT_READ,
+                    apple_msg_id: inst.id.clone(),
+                    sender: sender.clone(),
+                    timestamp_ms: ts_ms,
+                }),
                 _ => {
-                    debug!("[apple] ignoring non-text message id={}", inst.id);
+                    debug!("[apple] ignoring message id={} (not shown on the phone)", inst.id);
+                    None
+                }
+            };
+            let Some(body) = body else { continue };
+
+            // Persist to client outbox(es) BEFORE certifying delivery to Apple.
+            match body.encode() {
+                Ok(encoded) => {
+                    let _ = rx_hub.deliver_all(encoded).await;
+                }
+                Err(e) => {
+                    warn!("failed to encode body for {}: {:#}", inst.id, e);
+                    continue;
+                }
+            }
+
+            // Certify or send delivery receipt after outbox persistence.
+            if let Some(ctx) = inst.certified_context {
+                if let Err(e) = rx_client
+                    .identity
+                    .certify_delivery("com.apple.madrid", &ctx, inst.send_delivered)
+                    .await
+                {
+                    warn!("certify_delivery failed for {}: {}", inst.id, e);
+                }
+            } else if is_normal && inst.send_delivered && !sender.is_empty() {
+                let my_handles = rx_client.identity.get_handles().await;
+                if let Some(me) = pick_sender_handle(&my_handles, rx_preferred.as_deref()) {
+                    let mut delivered = MessageInst::new(
+                        ConversationData {
+                            participants: vec![sender.clone()],
+                            cv_name: None,
+                            sender_guid,
+                            after_guid: None,
+                        },
+                        &me,
+                        Message::Delivered,
+                    );
+                    delivered.id = inst.id.clone();
+                    delivered.target = inst.target;
+                    if let Err(e) = rx_client.send(&mut delivered).await {
+                        warn!("failed to send Message::Delivered for {}: {}", inst.id, e);
+                    }
                 }
             }
         }
@@ -1327,82 +1387,68 @@ async fn bridge_session(
                         let reply = AppBody::Handles { handles, preferred };
                         deliver(hub, &msg.client_id, reply).await;
                     }
-                    AppBody::SendText {
-                        client_msg_id,
-                        target,
-                        text,
-                        sender_guid,
-                    } => {
-                        let im_client = Arc::clone(&im_client);
-                        let hub = Arc::clone(hub);
-                        let preferred = preferred_handle.clone();
-                        let client_id = msg.client_id;
-
-                        tokio::spawn(async move {
-                            let result = send_imessage(
-                                &im_client,
-                                preferred.as_deref(),
-                                &[target],
-                                text,
-                                sender_guid,
-                            )
-                            .await;
-
-                            let reply = match result {
-                                Ok(apple_id) => AppBody::SendResult {
-                                    client_msg_id,
-                                    ok: true,
-                                    apple_msg_id: Some(apple_id),
-                                    error: None,
-                                },
-                                Err(e) => AppBody::SendResult {
-                                    client_msg_id,
-                                    ok: false,
-                                    apple_msg_id: None,
-                                    error: Some(format!("{:#}", e)),
-                                },
-                            };
-
-                            deliver(&hub, &client_id, reply).await;
-                        });
-                    }
-                    AppBody::SendGroupText {
+                    AppBody::SendMessage {
                         client_msg_id,
                         participants,
-                        text,
                         sender_guid,
+                        text,
+                        attachments,
                     } => {
                         let im_client = Arc::clone(&im_client);
                         let hub = Arc::clone(hub);
+                        let conn = conn.clone();
                         let preferred = preferred_handle.clone();
                         let client_id = msg.client_id;
 
                         tokio::spawn(async move {
                             let result = send_imessage(
                                 &im_client,
+                                &conn,
+                                &hub.media,
                                 preferred.as_deref(),
                                 &participants,
                                 text,
+                                &attachments,
                                 sender_guid,
                             )
                             .await;
+                            if result.is_ok() {
+                                for a in &attachments {
+                                    hub.media.remove_upload(&a.upload_id);
+                                }
+                            }
+                            deliver(&hub, &client_id, send_result(client_msg_id, result)).await;
+                        });
+                    }
+                    AppBody::SendReaction {
+                        client_msg_id,
+                        participants,
+                        sender_guid,
+                        target_id,
+                        reaction,
+                        emoji,
+                        enable,
+                        target_text,
+                    } => {
+                        let im_client = Arc::clone(&im_client);
+                        let hub = Arc::clone(hub);
+                        let preferred = preferred_handle.clone();
+                        let client_id = msg.client_id;
 
-                            let reply = match result {
-                                Ok(apple_id) => AppBody::SendResult {
-                                    client_msg_id,
-                                    ok: true,
-                                    apple_msg_id: Some(apple_id),
-                                    error: None,
-                                },
-                                Err(e) => AppBody::SendResult {
-                                    client_msg_id,
-                                    ok: false,
-                                    apple_msg_id: None,
-                                    error: Some(format!("{:#}", e)),
-                                },
-                            };
-
-                            deliver(&hub, &client_id, reply).await;
+                        tokio::spawn(async move {
+                            let result = send_reaction(
+                                &im_client,
+                                preferred.as_deref(),
+                                &participants,
+                                sender_guid,
+                                target_id,
+                                reaction,
+                                emoji,
+                                enable,
+                                target_text,
+                            )
+                            .await;
+                            deliver(&hub, &client_id, send_result(client_msg_id, result)).await;
                         });
                     }
                     AppBody::CheckTargets { req_id, targets } => {
@@ -1724,67 +1770,88 @@ async fn check_imessage_targets(
     }
 }
 
-async fn send_imessage(
+fn send_result(client_msg_id: String, result: Result<String>) -> AppBody {
+    match result {
+        Ok(apple_id) => AppBody::SendResult {
+            client_msg_id,
+            ok: true,
+            apple_msg_id: Some(apple_id),
+            error: None,
+        },
+        Err(e) => AppBody::SendResult {
+            client_msg_id,
+            ok: false,
+            apple_msg_id: None,
+            error: Some(format!("{:#}", e)),
+        },
+    }
+}
+
+struct Outgoing {
+    me: String,
+    targets: Vec<String>,
+    conv: ConversationData,
+}
+
+/// Normalizes `raw_targets`, picks our sending handle, and (with `check_registered`) refuses
+/// targets that are not on iMessage.
+async fn outgoing_conversation(
     im_client: &IMClient,
     preferred_handle: Option<&str>,
     raw_targets: &[String],
-    text: String,
     sender_guid: Option<String>,
-) -> Result<String> {
-    if raw_targets.is_empty() {
-        bail!("no recipients specified");
-    }
-    let mut targets: Vec<String> = Vec::with_capacity(raw_targets.len());
-    for raw in raw_targets {
-        let t = normalize_target(raw);
-        if !targets.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
-            targets.push(t);
-        }
-    }
+    check_registered: bool,
+) -> Result<Outgoing> {
     let handles = im_client.identity.get_handles().await;
     let me = pick_sender_handle(&handles, preferred_handle)
         .ok_or_else(|| anyhow!("no registered iMessage handle available"))?;
+    let mut targets: Vec<String> = Vec::with_capacity(raw_targets.len());
+    for raw in raw_targets {
+        let t = normalize_target(raw);
+        if !t.eq_ignore_ascii_case(&me) && !targets.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+            targets.push(t);
+        }
+    }
+    if targets.is_empty() {
+        bail!("no recipients specified");
+    }
 
-    match registered_targets(im_client, &targets, &me).await {
-        Ok(valid) => {
-            for target in &targets {
-                if !valid.iter().any(|v| v.eq_ignore_ascii_case(target)) {
-                    bail!("target '{}' is not registered on iMessage", target);
+    if check_registered {
+        match registered_targets(im_client, &targets, &me).await {
+            Ok(valid) => {
+                for target in &targets {
+                    if !valid.iter().any(|v| v.eq_ignore_ascii_case(target)) {
+                        bail!("target '{}' is not registered on iMessage", target);
+                    }
                 }
             }
-        }
-        Err(e) => {
-            warn!(
-                "validate_targets for {:?} failed ({}); proceeding to send anyway",
-                targets, e
-            );
+            Err(e) => {
+                warn!(
+                    "validate_targets for {:?} failed ({}); proceeding to send anyway",
+                    targets, e
+                );
+            }
         }
     }
 
     let mut participants = targets.clone();
-    if !participants.iter().any(|p| p.eq_ignore_ascii_case(&me)) {
-        participants.push(me.clone());
-    }
+    participants.push(me.clone());
+    Ok(Outgoing {
+        me,
+        targets,
+        conv: ConversationData {
+            participants,
+            cv_name: None,
+            sender_guid,
+            after_guid: None,
+        },
+    })
+}
 
-    let conv = ConversationData {
-        participants,
-        cv_name: None,
-        sender_guid,
-        after_guid: None,
-    };
-    let mut inst = MessageInst::new(
-        conv,
-        &me,
-        Message::Message(NormalMessage::new(text, MessageType::IMessage)),
-    );
-
-    info!(
-        "[client->apple] sending iMessage id={} from={} to={:?}",
-        inst.id, me, targets
-    );
-
+/// Sends `inst`, waiting at most SEND_CONFIRM_WAIT for every recipient device to confirm.
+async fn send_and_confirm(im_client: &IMClient, inst: &mut MessageInst) -> Result<()> {
     let job = im_client
-        .send(&mut inst)
+        .send(inst)
         .await
         .map_err(|e| anyhow!("IMClient::send failed: {}", e))?;
 
@@ -1802,8 +1869,291 @@ async fn send_imessage(
             ),
         }
     }
+    Ok(())
+}
 
+/// Uploads one attachment (converted for iPhones) to Apple.
+async fn upload_attachment(
+    conn: &APSConnection,
+    media: &MediaStore,
+    a: &OutAttachment,
+) -> Result<Attachment> {
+    let out = media.prepare_outgoing(&a.upload_id, &a.name, &a.mime).await?;
+    let prepared = MMCSFile::prepare_put(fs::File::open(&out.path)?)
+        .await
+        .map_err(|e| anyhow!("preparing {} for Apple failed: {}", out.name, e))?;
+    let att = Attachment::new_mmcs(
+        conn,
+        &prepared,
+        fs::File::open(&out.path)?,
+        &out.mime,
+        &out.uti,
+        &out.name,
+        |_, _| {},
+    )
+    .await
+    .map_err(|e| anyhow!("uploading {} to Apple failed: {}", out.name, e))?;
+    info!("uploaded {} ({}, {} bytes) to Apple", out.name, out.mime, att.get_size());
+    Ok(att)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_imessage(
+    im_client: &IMClient,
+    conn: &APSConnection,
+    media: &MediaStore,
+    preferred_handle: Option<&str>,
+    raw_targets: &[String],
+    text: String,
+    attachments: &[OutAttachment],
+    sender_guid: Option<String>,
+) -> Result<String> {
+    let out = outgoing_conversation(im_client, preferred_handle, raw_targets, sender_guid, true).await?;
+
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
+    for a in attachments {
+        parts.push(IndexedMessagePart {
+            part: MessagePart::Attachment(upload_attachment(conn, media, a).await?),
+            idx: None,
+            ext: None,
+        });
+    }
+    if !text.is_empty() || parts.is_empty() {
+        parts.push(IndexedMessagePart {
+            part: MessagePart::Text(text, Default::default()),
+            idx: None,
+            ext: None,
+        });
+    }
+    let mut nm = NormalMessage::new(String::new(), MessageType::IMessage);
+    nm.parts = MessageParts(parts);
+
+    let mut inst = MessageInst::new(out.conv, &out.me, Message::Message(nm));
+    info!(
+        "[client->apple] sending iMessage id={} from={} to={:?} attachments={}",
+        inst.id,
+        out.me,
+        out.targets,
+        attachments.len()
+    );
+    send_and_confirm(im_client, &mut inst).await?;
     Ok(inst.id)
+}
+
+fn reaction_from_code(code: u8, emoji: Option<String>) -> Result<Reaction> {
+    Ok(match code {
+        REACT_HEART => Reaction::Heart,
+        REACT_LIKE => Reaction::Like,
+        REACT_DISLIKE => Reaction::Dislike,
+        REACT_LAUGH => Reaction::Laugh,
+        REACT_EMPHASIZE => Reaction::Emphasize,
+        REACT_QUESTION => Reaction::Question,
+        REACT_EMOJI => Reaction::Emoji(
+            emoji
+                .filter(|e| !e.is_empty())
+                .ok_or_else(|| anyhow!("emoji reaction without an emoji"))?,
+        ),
+        other => bail!("can't send reaction kind {}", other),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_reaction(
+    im_client: &IMClient,
+    preferred_handle: Option<&str>,
+    raw_targets: &[String],
+    sender_guid: Option<String>,
+    target_id: String,
+    code: u8,
+    emoji: Option<String>,
+    enable: bool,
+    target_text: String,
+) -> Result<String> {
+    let reaction = reaction_from_code(code, emoji)?;
+    let out = outgoing_conversation(im_client, preferred_handle, raw_targets, sender_guid, false).await?;
+    let mut inst = MessageInst::new(
+        out.conv,
+        &out.me,
+        Message::React(ReactMessage {
+            to_uuid: target_id.clone(),
+            to_part: Some(0),
+            reaction: ReactMessageType::React { reaction, enable },
+            to_text: target_text,
+            embedded_profile: None,
+        }),
+    );
+    info!(
+        "[client->apple] sending reaction id={} kind={} enable={} on={} to={:?}",
+        inst.id, code, enable, target_id, out.targets
+    );
+    send_and_confirm(im_client, &mut inst).await?;
+    Ok(inst.id)
+}
+
+/// (kind, emoji, enable) of an incoming tapback, or None for iMessage-app updates.
+fn reaction_code(r: &ReactMessage) -> Option<(u8, Option<String>, bool)> {
+    match &r.reaction {
+        ReactMessageType::React { reaction, enable } => Some(match reaction {
+            Reaction::Heart => (REACT_HEART, None, *enable),
+            Reaction::Like => (REACT_LIKE, None, *enable),
+            Reaction::Dislike => (REACT_DISLIKE, None, *enable),
+            Reaction::Laugh => (REACT_LAUGH, None, *enable),
+            Reaction::Emphasize => (REACT_EMPHASIZE, None, *enable),
+            Reaction::Question => (REACT_QUESTION, None, *enable),
+            Reaction::Emoji(e) => (REACT_EMOJI, Some(e.clone()), *enable),
+            Reaction::Sticker { .. } => (REACT_STICKER, None, *enable),
+        }),
+        // A sticker dropped onto the message.
+        ReactMessageType::Extension { spec, .. } if spec.balloon.is_none() => {
+            Some((REACT_STICKER, None, true))
+        }
+        ReactMessageType::Extension { .. } => None,
+    }
+}
+
+/// "[Apple Cash]", "[GamePigeon: 8 Ball]": a readable stand-in for an iMessage app bubble.
+fn object_label(breadcrumb: &str, app: Option<&ExtensionApp>) -> String {
+    let mut label = breadcrumb.trim().to_string();
+    let mut detail = String::new();
+    if let Some(app) = app {
+        if label.is_empty() {
+            label = app.name.trim().to_string();
+        }
+        if let Some(b) = &app.balloon {
+            if let Some(BalloonLayout::TemplateLayout {
+                caption, subcaption, ..
+            }) = &b.layout
+            {
+                detail = [caption.trim(), subcaption.trim()]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
+            if detail.is_empty() {
+                if let Some(t) = &b.ld_text {
+                    detail = t.trim().to_string();
+                }
+            }
+        }
+    }
+    if label.is_empty() {
+        label = "iMessage app".to_string();
+    }
+    if !detail.is_empty() && !detail.eq_ignore_ascii_case(&label) {
+        format!("[{}: {}]", label, detail)
+    } else {
+        format!("[{}]", label)
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{} KB", bytes / 1_000)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Text shown when an attachment can't be delivered as media.
+fn attachment_placeholder(kind: u8, name: &str, size: u64) -> String {
+    match kind {
+        ATTACH_IMAGE => "[Photo]".to_string(),
+        ATTACH_STICKER => "[Sticker]".to_string(),
+        ATTACH_VIDEO => "[Video]".to_string(),
+        ATTACH_VOICE => "[Voice message]".to_string(),
+        ATTACH_AUDIO => format!("[Audio: {}]", name),
+        ATTACH_VCARD => format!("[Contact: {}]", name.trim_end_matches(".vcf")),
+        _ if size > 0 => format!("[File: {}, {}]", name, human_size(size)),
+        _ => format!("[File: {}]", name),
+    }
+}
+
+fn push_line(text: &mut String, line: &str) {
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line);
+}
+
+fn is_link_preview(app: &ExtensionApp) -> bool {
+    app.bundle_id.contains("URLBalloonProvider")
+}
+
+/// The text of `parts` with mentions flattened, app bubbles labelled and attachments left out.
+fn parts_text(parts: &MessageParts, app: Option<&ExtensionApp>) -> String {
+    let mut text = String::new();
+    for p in &parts.0 {
+        match &p.part {
+            MessagePart::Text(t, _) => text.push_str(t),
+            MessagePart::Mention(_, t) => {
+                text.push('@');
+                text.push_str(t);
+            }
+            MessagePart::Object(b) => push_line(&mut text, &object_label(b, app)),
+            MessagePart::Attachment(_) => {}
+        }
+    }
+    text.trim().to_string()
+}
+
+/// Turns an incoming message into phone text plus media to fetch (registered with `media`).
+fn render_message(nm: &NormalMessage, media: &Arc<MediaStore>) -> (String, Vec<InAttachment>) {
+    let app = nm.app.as_ref().filter(|a| !is_link_preview(a));
+    let mut text = String::new();
+    let mut attachments = Vec::new();
+    let mut saw_object = false;
+    for p in &nm.parts.0 {
+        match &p.part {
+            MessagePart::Text(t, _) => text.push_str(t),
+            MessagePart::Mention(_, t) => {
+                text.push('@');
+                text.push_str(t);
+            }
+            MessagePart::Object(b) => {
+                saw_object = true;
+                push_line(&mut text, &object_label(b, app));
+            }
+            MessagePart::Attachment(a) => {
+                let sticker = p.ext.is_some();
+                let size = a.get_size() as u64;
+                let kind = media::classify(&a.mime, &a.uti_type, &a.name, nm.voice, sticker);
+                if kind == ATTACH_FILE {
+                    push_line(&mut text, &attachment_placeholder(kind, &a.name, size));
+                    continue;
+                }
+                match media.register_incoming(a, nm.voice, sticker) {
+                    Ok(r) => attachments.push(r),
+                    Err(e) => {
+                        warn!("couldn't keep attachment {}: {:#}", a.name, e);
+                        push_line(&mut text, &attachment_placeholder(kind, &a.name, size));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(app) = app {
+        if !saw_object {
+            let label = object_label("", Some(app));
+            text = if text.trim().is_empty() {
+                label
+            } else {
+                format!("{}\n{}", label, text)
+            };
+        }
+    }
+    let mut text = text.trim().to_string();
+    if let Some(subject) = nm.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        text = if text.is_empty() {
+            subject.to_string()
+        } else {
+            format!("{}\n{}", subject, text)
+        };
+    }
+    (text, attachments)
 }
 
 /// How long a send waits for every recipient device to confirm (the phone waits 25 seconds).

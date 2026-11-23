@@ -1,12 +1,15 @@
 use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+/// 2: 32-bit frame lengths, media connections (ROLE_MEDIA), rich message bodies.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 pub const ROLE_MAIN: u8 = 0;
 pub const ROLE_PROBE: u8 = 1;
 /// HELLO token carries a one-time pairing code; the server answers with PAIRED.
 pub const ROLE_PAIR: u8 = 2;
+/// Short-lived connection for attachment downloads (MEDIA_GET) and uploads (MEDIA_PUT).
+pub const ROLE_MEDIA: u8 = 3;
 
 pub const FRAME_HELLO: u8 = 0x01;
 pub const FRAME_WELCOME: u8 = 0x02;
@@ -17,6 +20,11 @@ pub const FRAME_PONG: u8 = 0x06;
 pub const FRAME_SET_INTERVAL: u8 = 0x07;
 pub const FRAME_BYE: u8 = 0x08;
 pub const FRAME_PAIRED: u8 = 0x09;
+pub const FRAME_MEDIA_GET: u8 = 0x0A;
+pub const FRAME_MEDIA_DATA: u8 = 0x0B;
+pub const FRAME_MEDIA_PUT: u8 = 0x0C;
+pub const FRAME_MEDIA_PUT_ACK: u8 = 0x0D;
+pub const FRAME_MEDIA_ERR: u8 = 0x0E;
 
 pub const BYE_NORMAL: u8 = 0x00;
 pub const BYE_REPLACED: u8 = 0x01;
@@ -32,8 +40,12 @@ pub const PROBE_CAP_S: u64 = 60 * 60;
 /// Probe server must never close idle connections before PROBE_CAP + 5 min (65 min).
 pub const PROBE_SERVER_IDLE_S: u64 = PROBE_CAP_S + 5 * 60 + 30;
 
-pub const MAX_PAYLOAD_LEN: usize = u16::MAX as usize;
+/// Frame header: type (u8) + payload length (u32 BE).
+pub const HEADER_LEN: usize = 5;
+pub const MAX_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
 pub const MAX_MSG_BODY_LEN: usize = MAX_PAYLOAD_LEN - 8;
+/// Bytes of file data per MEDIA_DATA / MEDIA_PUT frame.
+pub const MEDIA_CHUNK_LEN: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -71,6 +83,34 @@ pub enum Frame {
         client_id: String,
         token: String,
     },
+    /// Phone -> server: send attachment `id` from byte `offset` (preview, or the full-size file).
+    MediaGet {
+        id: String,
+        full: bool,
+        offset: u64,
+    },
+    /// Server -> phone: one piece of the requested file; the last one ends at `total`.
+    MediaData {
+        total: u64,
+        offset: u64,
+        mime: String,
+        name: String,
+        data: Vec<u8>,
+    },
+    /// Phone -> server: one piece of an upload; the server answers MEDIA_PUT_ACK once it has `total`.
+    MediaPut {
+        id: String,
+        offset: u64,
+        total: u64,
+        data: Vec<u8>,
+    },
+    MediaPutAck {
+        id: String,
+        received: u64,
+    },
+    MediaErr {
+        message: String,
+    },
 }
 
 pub fn bye_reason_name(reason: u8) -> &'static str {
@@ -82,6 +122,46 @@ pub fn bye_reason_name(reason: u8) -> &'static str {
         BYE_PROTOCOL_ERROR => "protocol_error",
         BYE_SERVER_SHUTDOWN => "server_shutdown",
         _ => "unknown",
+    }
+}
+
+fn put_str16(buf: &mut Vec<u8>, s: &str) -> Result<()> {
+    if s.len() > u16::MAX as usize {
+        bail!("string too long: {} bytes", s.len());
+    }
+    buf.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    buf.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+struct Rd<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Rd<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.pos + n > self.data.len() {
+            bail!("frame payload too short");
+        }
+        let s = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into()?))
+    }
+    fn str16(&mut self) -> Result<String> {
+        let n = u16::from_be_bytes(self.take(2)?.try_into()?) as usize;
+        Ok(std::str::from_utf8(self.take(n)?)?.to_string())
+    }
+    fn rest(&mut self) -> Vec<u8> {
+        let s = self.data[self.pos..].to_vec();
+        self.pos = self.data.len();
+        s
     }
 }
 
@@ -97,6 +177,11 @@ impl Frame {
             Frame::SetInterval { .. } => FRAME_SET_INTERVAL,
             Frame::Bye { .. } => FRAME_BYE,
             Frame::Paired { .. } => FRAME_PAIRED,
+            Frame::MediaGet { .. } => FRAME_MEDIA_GET,
+            Frame::MediaData { .. } => FRAME_MEDIA_DATA,
+            Frame::MediaPut { .. } => FRAME_MEDIA_PUT,
+            Frame::MediaPutAck { .. } => FRAME_MEDIA_PUT_ACK,
+            Frame::MediaErr { .. } => FRAME_MEDIA_ERR,
         }
     }
 
@@ -155,136 +240,151 @@ impl Frame {
                     payload.extend_from_slice(s.as_bytes());
                 }
             }
+            Frame::MediaGet { id, full, offset } => {
+                put_str16(&mut payload, id)?;
+                payload.push(*full as u8);
+                payload.extend_from_slice(&offset.to_be_bytes());
+            }
+            Frame::MediaData {
+                total,
+                offset,
+                mime,
+                name,
+                data,
+            } => {
+                payload.extend_from_slice(&total.to_be_bytes());
+                payload.extend_from_slice(&offset.to_be_bytes());
+                put_str16(&mut payload, mime)?;
+                put_str16(&mut payload, name)?;
+                payload.extend_from_slice(data);
+            }
+            Frame::MediaPut {
+                id,
+                offset,
+                total,
+                data,
+            } => {
+                put_str16(&mut payload, id)?;
+                payload.extend_from_slice(&offset.to_be_bytes());
+                payload.extend_from_slice(&total.to_be_bytes());
+                payload.extend_from_slice(data);
+            }
+            Frame::MediaPutAck { id, received } => {
+                put_str16(&mut payload, id)?;
+                payload.extend_from_slice(&received.to_be_bytes());
+            }
+            Frame::MediaErr { message } => {
+                put_str16(&mut payload, message)?;
+            }
         }
 
         if payload.len() > MAX_PAYLOAD_LEN {
             bail!("frame payload {} exceeds {}", payload.len(), MAX_PAYLOAD_LEN);
         }
 
-        let mut out = Vec::with_capacity(3 + payload.len());
+        let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
         out.push(self.frame_type());
-        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         out.extend_from_slice(&payload);
         Ok(out)
     }
 
     pub fn decode(frame_type: u8, payload: &[u8]) -> Result<Self> {
-        match frame_type {
+        let mut r = Rd { data: payload, pos: 0 };
+        let frame = match frame_type {
             FRAME_HELLO => {
-                if payload.len() < 3 {
-                    bail!("HELLO payload too short: {}", payload.len());
-                }
-                let version = payload[0];
-                let role = payload[1];
-                let token_len = payload[2] as usize;
-                let expected = 3 + token_len + 8 + 2;
-                if payload.len() != expected {
-                    bail!(
-                        "HELLO payload length mismatch: got {}, expected {}",
-                        payload.len(),
-                        expected
-                    );
-                }
-                let token = payload[3..3 + token_len].to_vec();
-                let seq_off = 3 + token_len;
-                let last_rx_seq = u64::from_be_bytes(payload[seq_off..seq_off + 8].try_into()?);
-                let interval_s = u16::from_be_bytes(payload[seq_off + 8..seq_off + 10].try_into()?);
-                Ok(Frame::Hello {
+                let version = r.u8()?;
+                let role = r.u8()?;
+                let token_len = r.u8()? as usize;
+                let token = r.take(token_len)?.to_vec();
+                let last_rx_seq = r.u64()?;
+                let interval_s = u16::from_be_bytes(r.take(2)?.try_into()?);
+                Frame::Hello {
                     version,
                     role,
                     token,
                     last_rx_seq,
                     interval_s,
-                })
-            }
-            FRAME_WELCOME => {
-                if payload.len() != 8 {
-                    bail!("WELCOME payload length {} != 8", payload.len());
                 }
-                let last_rx_seq = u64::from_be_bytes(payload[0..8].try_into()?);
-                Ok(Frame::Welcome { last_rx_seq })
             }
-            FRAME_MSG => {
-                if payload.len() < 8 {
-                    bail!("MSG payload too short: {}", payload.len());
-                }
-                let seq = u64::from_be_bytes(payload[0..8].try_into()?);
-                let body = payload[8..].to_vec();
-                Ok(Frame::Msg { seq, body })
-            }
-            FRAME_ACK => {
-                if payload.len() != 8 {
-                    bail!("ACK payload length {} != 8", payload.len());
-                }
-                let seq = u64::from_be_bytes(payload[0..8].try_into()?);
-                Ok(Frame::Ack { seq })
-            }
-            FRAME_PING => {
-                if payload.len() != 4 {
-                    bail!("PING payload length {} != 4", payload.len());
-                }
-                let nonce = u32::from_be_bytes(payload[0..4].try_into()?);
-                Ok(Frame::Ping { nonce })
-            }
-            FRAME_PONG => {
-                if payload.len() != 4 {
-                    bail!("PONG payload length {} != 4", payload.len());
-                }
-                let nonce = u32::from_be_bytes(payload[0..4].try_into()?);
-                Ok(Frame::Pong { nonce })
-            }
-            FRAME_SET_INTERVAL => {
-                if payload.len() != 2 {
-                    bail!("SET_INTERVAL payload length {} != 2", payload.len());
-                }
-                let interval_s = u16::from_be_bytes(payload[0..2].try_into()?);
-                Ok(Frame::SetInterval { interval_s })
-            }
-            FRAME_BYE => {
-                if payload.len() != 1 {
-                    bail!("BYE payload length {} != 1", payload.len());
-                }
-                Ok(Frame::Bye { reason: payload[0] })
-            }
+            FRAME_WELCOME => Frame::Welcome { last_rx_seq: r.u64()? },
+            FRAME_MSG => Frame::Msg {
+                seq: r.u64()?,
+                body: r.rest(),
+            },
+            FRAME_ACK => Frame::Ack { seq: r.u64()? },
+            FRAME_PING => Frame::Ping {
+                nonce: u32::from_be_bytes(r.take(4)?.try_into()?),
+            },
+            FRAME_PONG => Frame::Pong {
+                nonce: u32::from_be_bytes(r.take(4)?.try_into()?),
+            },
+            FRAME_SET_INTERVAL => Frame::SetInterval {
+                interval_s: u16::from_be_bytes(r.take(2)?.try_into()?),
+            },
+            FRAME_BYE => Frame::Bye { reason: r.u8()? },
             FRAME_PAIRED => {
                 let mut fields = Vec::with_capacity(2);
-                let mut pos = 0usize;
                 for _ in 0..2 {
-                    let len = *payload.get(pos).ok_or_else(|| anyhow::anyhow!("PAIRED payload too short"))? as usize;
-                    pos += 1;
-                    let end = pos + len;
-                    if end > payload.len() {
-                        bail!("PAIRED payload too short");
-                    }
-                    fields.push(std::str::from_utf8(&payload[pos..end])?.to_string());
-                    pos = end;
-                }
-                if pos != payload.len() {
-                    bail!("PAIRED payload has trailing bytes");
+                    let len = r.u8()? as usize;
+                    fields.push(std::str::from_utf8(r.take(len)?)?.to_string());
                 }
                 let token = fields.pop().unwrap_or_default();
                 let client_id = fields.pop().unwrap_or_default();
-                Ok(Frame::Paired { client_id, token })
+                Frame::Paired { client_id, token }
             }
+            FRAME_MEDIA_GET => Frame::MediaGet {
+                id: r.str16()?,
+                full: r.u8()? != 0,
+                offset: r.u64()?,
+            },
+            FRAME_MEDIA_DATA => Frame::MediaData {
+                total: r.u64()?,
+                offset: r.u64()?,
+                mime: r.str16()?,
+                name: r.str16()?,
+                data: r.rest(),
+            },
+            FRAME_MEDIA_PUT => Frame::MediaPut {
+                id: r.str16()?,
+                offset: r.u64()?,
+                total: r.u64()?,
+                data: r.rest(),
+            },
+            FRAME_MEDIA_PUT_ACK => Frame::MediaPutAck {
+                id: r.str16()?,
+                received: r.u64()?,
+            },
+            FRAME_MEDIA_ERR => Frame::MediaErr { message: r.str16()? },
             other => bail!("unknown frame type 0x{:02x}", other),
+        };
+        if r.pos != payload.len() {
+            bail!(
+                "frame 0x{:02x} has {} trailing bytes",
+                frame_type,
+                payload.len() - r.pos
+            );
         }
+        Ok(frame)
     }
 }
 
 /// Reads a single frame from an AsyncRead stream. Returns Ok(None) on clean EOF at frame boundary.
 /// Note: NOT cancel-safe; always run in a dedicated reader task.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Frame>> {
-    let mut header = [0u8; 3];
-    let first = match reader.read(&mut header[0..1]).await {
+    let mut header = [0u8; HEADER_LEN];
+    match reader.read(&mut header[0..1]).await {
         Ok(0) => return Ok(None),
-        Ok(n) => n,
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    debug_assert_eq!(first, 1);
-    reader.read_exact(&mut header[1..3]).await?;
+    reader.read_exact(&mut header[1..HEADER_LEN]).await?;
     let frame_type = header[0];
-    let len = u16::from_be_bytes([header[1], header[2]]) as usize;
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > MAX_PAYLOAD_LEN {
+        bail!("frame payload length {} exceeds {}", len, MAX_PAYLOAD_LEN);
+    }
     let mut payload = vec![0u8; len];
     if len > 0 {
         reader.read_exact(&mut payload).await?;
@@ -330,6 +430,31 @@ mod tests {
                 client_id: "phone-1a2b".into(),
                 token: "00ff".repeat(16),
             },
+            Frame::MediaGet {
+                id: "m-1".into(),
+                full: true,
+                offset: 1024,
+            },
+            Frame::MediaData {
+                total: 300_000,
+                offset: 262_144,
+                mime: "image/jpeg".into(),
+                name: "IMG_0001.jpg".into(),
+                data: vec![0xAB; MEDIA_CHUNK_LEN],
+            },
+            Frame::MediaPut {
+                id: "u-1".into(),
+                offset: 0,
+                total: 3,
+                data: vec![1, 2, 3],
+            },
+            Frame::MediaPutAck {
+                id: "u-1".into(),
+                received: 3,
+            },
+            Frame::MediaErr {
+                message: "not found".into(),
+            },
         ];
 
         let mut buf = Vec::new();
@@ -343,5 +468,13 @@ mod tests {
             assert_eq!(&decoded, expected);
         }
         assert!(read_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_length() {
+        let mut buf = vec![FRAME_MSG];
+        buf.extend_from_slice(&((MAX_PAYLOAD_LEN as u32) + 1).to_be_bytes());
+        let mut cursor = &buf[..];
+        assert!(read_frame(&mut cursor).await.is_err());
     }
 }
