@@ -201,6 +201,7 @@ the other side act instead:
 | `/reply text` | answers with an inline reply to it |
 | `/edit text`, `/unsend` | edits or unsends its last echoed message |
 | `/photo`, `/video`, `/voice`, `/sticker` | sends a 12 MP photo, a 1080p MOV, a CAF voice message or a PNG sticker (needs ffmpeg) |
+| `/photos` | sends one message with four attachments (photo, sticker, photo, video) |
 | `/group text` | starts a group with you and a third person; the next group commands act on it |
 | `/gsay text` | says something in that group |
 | `/rename name`, `/icon` | renames the group, changes its photo |

@@ -153,7 +153,7 @@ fn normalize_echo(raw: &str) -> String {
 /// "other side" do something to the conversation instead of echoing:
 /// `/react N|emoji` (on the sent message), `/reply text`, `/edit text` and `/unsend` (on the
 /// last echo), `/rename name`, `/add handle`, `/remove handle`, `/icon`, `/photo`, `/video`,
-/// `/voice`, `/sticker`. `/group text` has the other side start a group with a third person;
+/// `/voice`, `/sticker`, `/photos` (four attachments in one message). `/group text` has the other side start a group with a third person;
 /// after that `/rename`, `/icon`, `/add`, `/remove` and `/gsay text` act on that group.
 #[allow(clippy::too_many_arguments)]
 fn echo_reply(
@@ -255,6 +255,26 @@ fn echo_reply(
                     };
                 }
                 Err(e) => warn!("[echo] can't make test {}: {:#}", cmd, e),
+            }
+        }
+        "photos" => {
+            // Several attachments in one message (an iPhone sending a few photos at once).
+            let kinds = ["photo", "sticker", "photo", "video"];
+            match kinds.iter().map(|k| echo_media(hub, k)).collect::<anyhow::Result<Vec<_>>>() {
+                Ok(atts) => {
+                    *last_echo_id = Some(id.clone());
+                    return AppBody::IncomingMessage {
+                        apple_msg_id: id,
+                        sender,
+                        participants,
+                        sender_guid,
+                        timestamp_ms: ts,
+                        text: arg,
+                        reply_to: None,
+                        attachments: atts,
+                    };
+                }
+                Err(e) => warn!("[echo] can't make test photos: {:#}", e),
             }
         }
         "rename" => return group(body::GROUP_RENAMED, arg, Vec::new()),
