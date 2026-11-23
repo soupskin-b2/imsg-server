@@ -14,8 +14,6 @@ use openssl::asn1::Asn1Time;
 use openssl::x509::X509;
 use plist::Data;
 use rand::RngCore;
-use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
-use rustpush::findmy::MULTIPLEX_SERVICE;
 use rustpush::{
     authenticate_phone, get_gateways_for_mccmnc, register, APSConnection, APSConnectionResource,
     APSState, AuthPhone, ConversationData, IDSNGMIdentity, IDSUser, IMClient, Message,
@@ -731,12 +729,7 @@ async fn register_users(
     let reg = register(
         os_cfg,
         &*conn.state.read().await,
-        &[
-            &MADRID_SERVICE,
-            &MULTIPLEX_SERVICE,
-            &FACETIME_SERVICE,
-            &VIDEO_SERVICE,
-        ],
+        &[&MADRID_SERVICE],
         users,
         identity,
     )
@@ -1009,12 +1002,7 @@ async fn bridge_session(
             conn.clone(),
             users,
             identity.clone(),
-            &[
-                &MADRID_SERVICE,
-                &MULTIPLEX_SERVICE,
-                &FACETIME_SERVICE,
-                &VIDEO_SERVICE,
-            ],
+            &[&MADRID_SERVICE],
             cfg.apple_dir.join("id_cache.plist"),
             Arc::clone(&os_cfg),
             Box::new(move |updated_users| {
