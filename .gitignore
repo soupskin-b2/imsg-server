@@ -1,0 +1,8 @@
+/target
+/config.toml
+/state/
+/apple/
+/certs/
+*.pem
+*.key
+pairing.json
