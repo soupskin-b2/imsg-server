@@ -315,8 +315,16 @@ async fn run_echo_backend(
     mut incoming_rx: mpsc::Receiver<IncomingClientMsg>,
 ) {
     info!("running in --no-apple echo mode");
-    let mut handle = String::new();
-    let mut fake_expires_ms: u64 = 0;
+    // The fake registration survives restarts (state_dir/echo_handle), so a test phone that was
+    // set up once doesn't have to go through setup again every time the server is restarted.
+    let handle_path = cfg.state_dir.join("echo_handle");
+    let mut handle = std::fs::read_to_string(&handle_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let mut fake_expires_ms: u64 = if handle.is_empty() { 0 } else { now_epoch_ms() + 30 * 86_400_000 };
+    if !handle.is_empty() {
+        info!("[echo] registered as {} (from {})", handle, handle_path.display());
+    }
     let mut relay_status_rx = relay.subscribe_status();
     let mut connect_rx = hub.subscribe_connects();
     let mut last_echo_id: Option<String> = None;
@@ -480,6 +488,11 @@ async fn run_echo_backend(
                             .unwrap_or_else(|_| "+15550001111".to_string());
                         handle = format!("tel:{}", number);
                         fake_expires_ms = now_epoch_ms() + 30 * 86_400_000;
+                        if let Err(e) = std::fs::create_dir_all(&cfg.state_dir)
+                            .and_then(|_| std::fs::write(&handle_path, &handle))
+                        {
+                            warn!("[echo] can't save {}: {}", handle_path.display(), e);
+                        }
                         let ready = AppBody::SetupStatus {
                             state: SETUP_READY,
                             detail: handle.clone(),

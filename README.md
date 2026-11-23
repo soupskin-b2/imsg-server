@@ -190,7 +190,8 @@ are not readable by the new one.
 ## Testing without Apple
 
 `imsg-server run --no-apple` (or `pair --no-apple`) skips Apple. It still runs the built-in relay
-(so you can test `relayserver` connectivity), simulates phone-number setup (any `REG-RESP` is accepted),
+(so you can test `relayserver` connectivity), simulates phone-number setup (any `REG-RESP` is accepted;
+the number is kept in `state_dir/echo_handle`, so a set-up phone stays set up across restarts),
 and echoes every sent message back, attachments included. A message starting with a command makes
 the other side act instead:
 
