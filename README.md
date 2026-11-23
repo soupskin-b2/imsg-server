@@ -19,6 +19,17 @@ SMS.
 - A registration relay (host and code) that provides iOS validation data, as used by OpenBubbles.
 - The phone, with the SIM for the number you want to use.
 
+## Install
+
+Prebuilt Linux x86_64 binaries are published on the
+[GitHub Releases](https://github.com/soupskin-b2/imsg-server/releases/latest) page:
+
+```sh
+curl -fsSLO https://github.com/soupskin-b2/imsg-server/releases/latest/download/imsg-server-linux-x86_64.tar.gz
+tar -xzf imsg-server-linux-x86_64.tar.gz
+sudo install -m 755 imsg-server /usr/local/bin/imsg-server
+```
+
 ## Build
 
 ```sh

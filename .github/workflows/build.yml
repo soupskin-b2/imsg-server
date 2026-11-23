@@ -1,5 +1,18 @@
 name: Build
-on: [push, pull_request]
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,3 +27,44 @@ jobs:
         run: cargo test
       - name: Build
         run: cargo build --release
+      - name: Package release archive
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          mkdir -p dist/stage
+          cp target/release/imsg-server LICENSE README.md dist/stage/
+          tar -C dist/stage -czf dist/imsg-server-linux-x86_64.tar.gz imsg-server LICENSE README.md
+          (cd dist && sha256sum imsg-server-linux-x86_64.tar.gz > imsg-server-linux-x86_64.tar.gz.sha256)
+      - name: Upload release artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: imsg-server-linux-x86_64
+          path: dist/imsg-server-linux-x86_64.tar.gz*
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: imsg-server-linux-x86_64
+          path: dist
+      - name: Publish rolling latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push -f origin "${GITHUB_SHA}:refs/tags/latest"
+          short_sha="${GITHUB_SHA::7}"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          notes="Rolling build from \`master\` (\`${short_sha}\`, version \`${version}\`)."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest dist/imsg-server-linux-x86_64.tar.gz dist/imsg-server-linux-x86_64.tar.gz.sha256 --clobber
+            gh release edit latest --title "Latest" --notes "$notes" --latest
+          else
+            gh release create latest dist/imsg-server-linux-x86_64.tar.gz dist/imsg-server-linux-x86_64.tar.gz.sha256 \
+              --title "Latest" --notes "$notes" --latest
+          fi
