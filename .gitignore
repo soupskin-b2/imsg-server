@@ -6,3 +6,4 @@
 *.pem
 *.key
 pairing.json
+/fairplay-certs/
