@@ -576,11 +576,13 @@ pub async fn run_apple(
                         };
                         deliver(&hub, client, reply).await;
                     }
-                    AppBody::CheckTargets { req_id, targets } => {
+                    AppBody::CheckTargets { req_id, .. } => {
+                        // Unknown, not unregistered: the phone caches a "not on iMessage" answer for a
+                        // day and would keep sending those contacts SMS after setup finishes.
                         let reply = AppBody::TargetStatus {
                             req_id,
                             registered: Vec::new(),
-                            unregistered: targets,
+                            unregistered: Vec::new(),
                         };
                         deliver(&hub, client, reply).await;
                     }
@@ -1694,11 +1696,7 @@ async fn check_imessage_targets(
             unregistered: Vec::new(),
         };
     };
-    match im_client
-        .identity
-        .validate_targets(&normalized, "com.apple.madrid", &me)
-        .await
-    {
+    match registered_targets(im_client, &normalized, &me).await {
         Ok(valid) => {
             let mut registered = Vec::new();
             let mut unregistered = Vec::new();
@@ -1747,11 +1745,7 @@ async fn send_imessage(
     let me = pick_sender_handle(&handles, preferred_handle)
         .ok_or_else(|| anyhow!("no registered iMessage handle available"))?;
 
-    match im_client
-        .identity
-        .validate_targets(&targets, "com.apple.madrid", &me)
-        .await
-    {
+    match registered_targets(im_client, &targets, &me).await {
         Ok(valid) => {
             for target in &targets {
                 if !valid.iter().any(|v| v.eq_ignore_ascii_case(target)) {
@@ -1794,14 +1788,61 @@ async fn send_imessage(
         .await
         .map_err(|e| anyhow!("IMClient::send failed: {}", e))?;
 
+    // rustpush keeps retrying devices that have not confirmed (an iPad or Mac that is off) for
+    // minutes, but the phone gives up after 25 seconds and sends the text as SMS. Apple has the
+    // message by now, so stop waiting after a while and let delivery go on in the background.
     if let Some(handle) = job.handle {
-        handle
-            .await
-            .map_err(|e| anyhow!("send task join error: {}", e))?
-            .map_err(|e| anyhow!("Apple delivery failed: {}", e))?;
+        match tokio::time::timeout(SEND_CONFIRM_WAIT, handle).await {
+            Ok(joined) => joined
+                .map_err(|e| anyhow!("send task join error: {}", e))?
+                .map_err(|e| anyhow!("Apple delivery failed: {}", e))?,
+            Err(_) => info!(
+                "iMessage id={} not confirmed by every device after {:?}; reporting it sent",
+                inst.id, SEND_CONFIRM_WAIT
+            ),
+        }
     }
 
     Ok(inst.id)
+}
+
+/// How long a send waits for every recipient device to confirm (the phone waits 25 seconds).
+const SEND_CONFIRM_WAIT: Duration = Duration::from_secs(12);
+
+/// Which of `targets` can receive iMessage. rustpush keeps a lookup that found no devices for an
+/// hour, and Apple sometimes answers with none (for example right after this server registers), so
+/// a target without devices is looked up once more, fresh, before it counts as not on iMessage.
+async fn registered_targets(
+    im_client: &IMClient,
+    targets: &[String],
+    me: &str,
+) -> Result<Vec<String>, PushError> {
+    let found = lookup_registered(im_client, targets, me).await?;
+    if targets
+        .iter()
+        .all(|t| found.iter().any(|f| f.eq_ignore_ascii_case(t)))
+    {
+        return Ok(found);
+    }
+    info!("no iMessage devices known for some of {:?}; looking them up again", targets);
+    im_client.identity.invalidate_id_cache().await;
+    lookup_registered(im_client, targets, me).await
+}
+
+async fn lookup_registered(
+    im_client: &IMClient,
+    targets: &[String],
+    me: &str,
+) -> Result<Vec<String>, PushError> {
+    let devices = im_client
+        .identity
+        .targets_for_handles("com.apple.madrid", targets, me)
+        .await?;
+    Ok(targets
+        .iter()
+        .filter(|t| devices.iter().any(|d| d.participant.eq_ignore_ascii_case(t)))
+        .cloned()
+        .collect())
 }
 
 #[cfg(test)]
