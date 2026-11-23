@@ -2186,6 +2186,69 @@ mod tests {
     use openssl::rsa::Rsa;
     use openssl::x509::X509Builder;
 
+    fn att(name: &str, mime: &str, uti: &str, data: &[u8]) -> Attachment {
+        Attachment {
+            a_type: rustpush::AttachmentType::Inline(data.to_vec()),
+            part: 0,
+            uti_type: uti.to_string(),
+            mime: mime.to_string(),
+            name: name.to_string(),
+            iris: false,
+        }
+    }
+
+    fn part(p: MessagePart) -> IndexedMessagePart {
+        IndexedMessagePart { part: p, idx: None, ext: None }
+    }
+
+    fn store() -> Arc<MediaStore> {
+        let dir = std::env::temp_dir().join(format!("imsg-test-{}", Uuid::new_v4()));
+        Arc::new(MediaStore::new(&dir, Some("/nonexistent/ffmpeg"), 1).unwrap())
+    }
+
+    #[tokio::test]
+    async fn renders_text_mentions_objects_and_files() {
+        let media = store();
+        let mut nm = NormalMessage::new(String::new(), MessageType::IMessage);
+        nm.parts = MessageParts(vec![
+            part(MessagePart::Mention("tel:+15551234567".into(), "Sam".into())),
+            part(MessagePart::Text(" sent you money".into(), Default::default())),
+            part(MessagePart::Object("Apple Cash".into())),
+            part(MessagePart::Attachment(att("report.pdf", "application/pdf", "com.adobe.pdf", &[0u8; 2048]))),
+        ]);
+        let (text, atts) = render_message(&nm, &media);
+        assert_eq!(text, "@Sam sent you money\n[Apple Cash]\n[File: report.pdf, 2 KB]");
+        assert!(atts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn photos_become_fetchable_attachments() {
+        let media = store();
+        let mut nm = NormalMessage::new(String::new(), MessageType::IMessage);
+        nm.parts = MessageParts(vec![
+            part(MessagePart::Attachment(att("IMG_0001.HEIC", "image/heic", "public.heic", b"x"))),
+            part(MessagePart::Text("look".into(), Default::default())),
+        ]);
+        nm.subject = Some("Trip".into());
+        let (text, atts) = render_message(&nm, &media);
+        assert_eq!(text, "Trip\nlook");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].kind, ATTACH_IMAGE);
+        assert_eq!(atts[0].name, "IMG_0001.HEIC");
+        assert!(crate::media::valid_id(&atts[0].media_id));
+    }
+
+    #[test]
+    fn labels_and_placeholders() {
+        assert_eq!(object_label("", None), "[iMessage app]");
+        assert_eq!(object_label(" Check In ", None), "[Check In]");
+        assert_eq!(attachment_placeholder(ATTACH_VOICE, "Audio Message.caf", 10), "[Voice message]");
+        assert_eq!(attachment_placeholder(ATTACH_FILE, "a.zip", 3_400_000), "[File: a.zip, 3.4 MB]");
+        assert_eq!(reaction_from_code(REACT_LAUGH, None).map(|r| matches!(r, Reaction::Laugh)).ok(), Some(true));
+        assert!(reaction_from_code(REACT_EMOJI, None).is_err());
+        assert!(reaction_from_code(REACT_STICKER, None).is_err());
+    }
+
     #[test]
     fn normalize_target_cases() {
         assert_eq!(normalize_target("+1 (555) 123-4567"), "tel:+15551234567");
