@@ -12,6 +12,21 @@ phone to text Apple's registration gateway, the phone passes Apple's reply back,
 finishes the registration. Messages to iPhone users then go as iMessage; everyone else still gets
 SMS.
 
+What crosses the bridge:
+
+- **Text**, 1:1 and group, with mentions, inline replies (shown with a short quote of the
+  original) and subjects. Formatting and effects arrive as plain text.
+- **Photos, videos, voice messages, audio and contacts**, both ways. The server downloads each
+  attachment from Apple and gives the phone a screen-size preview it can show: JPEG or PNG at
+  most 640 px (HEIC decoded), 240p H.264 video, AAC audio. "Save attachment" on the phone fetches
+  the full-size file (HEIC becomes a full-resolution JPEG, HEVC video becomes H.264). What the
+  phone sends (JPEG, 3GP, AMR) is converted to what iPhones show inline. Other files arrive as
+  `[File: name, size]`.
+- **Tapbacks**, shown as badges on the message, both ways (the phone sends the six standard ones).
+- **Edits** (`... (edited)`), **unsends** (`This message was unsent`), and group **renames, member
+  changes and photo changes** as notices in the conversation.
+- iMessage apps, Apple Cash, Check In and similar show a readable label such as `[Apple Cash]`.
+
 ## What you need
 
 - A Linux server reachable from the internet on port 443, with a domain name pointing at it.
@@ -20,6 +35,8 @@ SMS.
 - A jailbroken iPhone running [OpenBubbles/relayserver](https://github.com/OpenBubbles/relayserver),
   which supplies iOS validation data to this server's built-in relay.
 - The flip phone, with the SIM for the number you want to use.
+- `ffmpeg` (and ideally `heif-dec`) on the server for photos and videos:
+  `sudo apt install ffmpeg libheif-examples`. Without them attachments arrive as placeholders.
 
 ## Install
 
@@ -156,12 +173,36 @@ Everything the server keeps lives next to `config.toml`. Keep these private and 
 | `config.toml` | Settings, renewal lead time, and the hashed tokens of paired phones |
 | `apple/` | Apple device identity, registration, and built-in relay secret/provider state |
 | `state/` | Per-phone message queues, pending pairing code, and `apple_status.json` |
+| `state/media/` | Attachments (originals, previews and full-size copies), kept 30 days |
+
+Attachment handling can be tuned in `config.toml`:
+
+```toml
+[media]
+retention_days = 30          # how long "Save attachment" can still fetch the full-size file
+# ffmpeg = "/usr/bin/ffmpeg" # ffprobe is looked up next to it
+```
+
+The server and the phone must run the same protocol version: protocol 2 (this release) needs
+Messages Improved 1.5.0 or later. Update both together; messages still queued for an older phone
+are not readable by the new one.
 
 ## Testing without Apple
 
 `imsg-server run --no-apple` (or `pair --no-apple`) skips Apple. It still runs the built-in relay
 (so you can test `relayserver` connectivity), simulates phone-number setup (any `REG-RESP` is accepted),
-and echoes every sent message back.
+and echoes every sent message back, attachments included. A message starting with a command makes
+the other side act instead:
+
+| Send | The other side |
+| --- | --- |
+| `/react 0`…`/react 5`, `/react 🔥` | reacts to it (love, like, dislike, laugh, emphasize, question, or an emoji) |
+| `/reply text` | answers with an inline reply to it |
+| `/edit text`, `/unsend` | edits or unsends its last echoed message |
+| `/rename name`, `/icon` | renames the group, changes its photo |
+| `/add handle`, `/remove handle` | adds or removes a group member (`tel:+1…` or `mailto:…`) |
+
+Messages Improved's `tools/testing/imessage_interop_test.py` drives this mode end to end.
 
 ## License
 
