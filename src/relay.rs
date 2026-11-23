@@ -70,6 +70,81 @@ struct ProviderStore {
     provider_token: String,
     #[serde(default)]
     code: Option<String>,
+    /// Stable synthetic Mac identity substituted into `get-version-info` (see [`MacIdentity`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mac_identity: Option<MacIdentity>,
+}
+
+/// Synthetic `iMac13,1` serial number + UDID that replaces the iPhone's real identifiers in
+/// `get-version-info` responses.
+///
+/// rustpush activates relay devices with Albert as `DeviceClass=MacOS` / `ProductType=iMac13,1`,
+/// and since October 2026 Albert rejects a MacOS activation carrying an iPhone serial number.
+/// Only `serial_number` and `unique_device_id` are rewritten (the same as OpenBubblesProxy and
+/// jakecrowley/relayserver); the hardware/software version fields stay the iPhone's so they match
+/// the validation data the iPhone generates. Persisted in `relay_provider.json` because Albert
+/// activates each serial once, so it must not change across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacIdentity {
+    pub serial_number: String,
+    pub unique_device_id: String,
+}
+
+const SERIAL_YEAR_CHARS: &[u8] = b"CDFGHJKLMNPQRSTUVWX";
+const SERIAL_WEEK_CHARS: &[u8] = b"123456789CDFGHJKLMNPQRSTVW";
+const SERIAL_UNIT_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
+/// Model-code suffixes of real `iMac13,1` / `iMac13,2` serials.
+const SERIAL_MODEL_SUFFIXES: &[&str] = &[
+    "DNCT", "DNCR", "DNML", "DNMM", "F8QM", "F8QN", "F9RN", "FC6M", "FC6N", "FC6P", "FD55",
+    "FD5Y", "FF7L",
+];
+
+impl MacIdentity {
+    pub fn generate() -> Self {
+        let mut rng = rand::thread_rng();
+        let mut serial = String::with_capacity(12);
+        serial.push_str("C02");
+        serial.push(SERIAL_YEAR_CHARS[rng.gen_range(0..SERIAL_YEAR_CHARS.len())] as char);
+        serial.push(SERIAL_WEEK_CHARS[rng.gen_range(0..SERIAL_WEEK_CHARS.len())] as char);
+        for _ in 0..3 {
+            serial.push(SERIAL_UNIT_CHARS[rng.gen_range(0..SERIAL_UNIT_CHARS.len())] as char);
+        }
+        serial.push_str(SERIAL_MODEL_SUFFIXES[rng.gen_range(0..SERIAL_MODEL_SUFFIXES.len())]);
+        Self {
+            serial_number: serial,
+            unique_device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        is_valid_mac_serial(&self.serial_number)
+            && uuid::Uuid::parse_str(&self.unique_device_id).is_ok()
+    }
+
+    /// Rewrites `versions.serial_number` / `versions.unique_device_id` in a provider
+    /// `get-version-info` response, leaving every other field untouched.
+    fn apply_to_versions(&self, val: &mut serde_json::Value) {
+        if let Some(versions) = val.get_mut("versions").and_then(|v| v.as_object_mut()) {
+            versions.insert(
+                "serial_number".into(),
+                serde_json::Value::String(self.serial_number.clone()),
+            );
+            versions.insert(
+                "unique_device_id".into(),
+                serde_json::Value::String(self.unique_device_id.clone()),
+            );
+        }
+    }
+}
+
+fn is_valid_mac_serial(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 12
+        && s.starts_with("C02")
+        && SERIAL_YEAR_CHARS.contains(&b[3])
+        && SERIAL_WEEK_CHARS.contains(&b[4])
+        && b[5..8].iter().all(|c| SERIAL_UNIT_CHARS.contains(c))
+        && s.get(8..12).map_or(false, |m| SERIAL_MODEL_SUFFIXES.contains(&m))
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +215,7 @@ pub struct RelayHub {
     apple_dir: PathBuf,
     secret: [u8; 32],
     provider_token: String,
+    mac_identity: MacIdentity,
     internal_token: String,
     next_conn_id: AtomicU64,
     locked_code: StdMutex<Option<String>>,
@@ -155,7 +231,21 @@ impl RelayHub {
             .with_context(|| format!("failed to create apple_dir {}", apple_dir.display()))?;
 
         let secret = load_or_create_secret(&apple_dir.join("relay_secret"))?;
-        let store = load_or_create_store(&apple_dir.join("relay_provider.json"))?;
+        let store_path = apple_dir.join("relay_provider.json");
+        let mut store = load_or_create_store(&store_path)?;
+        let mac_identity = match store.mac_identity.as_ref().filter(|m| m.is_valid()) {
+            Some(m) => m.clone(),
+            None => {
+                let m = MacIdentity::generate();
+                info!(
+                    "generated synthetic Mac identity for Albert activation (serial {})",
+                    m.serial_number
+                );
+                store.mac_identity = Some(m.clone());
+                save_store_atomic(&store_path, &store)?;
+                m
+            }
+        };
 
         let mut internal_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut internal_bytes);
@@ -172,6 +262,7 @@ impl RelayHub {
             apple_dir: apple_dir.to_path_buf(),
             secret,
             provider_token: store.provider_token,
+            mac_identity,
             internal_token,
             next_conn_id: AtomicU64::new(1),
             locked_code: StdMutex::new(store.code),
@@ -500,6 +591,11 @@ impl RelayHub {
             return Err(BridgeError::ProviderError(err_str.to_string()));
         }
 
+        let mut val = val;
+        if command == "get-version-info" {
+            self.mac_identity.apply_to_versions(&mut val);
+        }
+
         serde_json::to_vec(&val).map_err(|e| BridgeError::Other(e.to_string()))
     }
 
@@ -797,6 +893,7 @@ impl RelayHub {
         let store = ProviderStore {
             provider_token: self.provider_token.clone(),
             code,
+            mac_identity: Some(self.mac_identity.clone()),
         };
         save_store_atomic(&self.apple_dir.join("relay_provider.json"), &store)
     }
@@ -879,6 +976,7 @@ fn load_or_create_store(path: &Path) -> Result<ProviderStore> {
     let store = ProviderStore {
         provider_token: hex::encode(tok),
         code: None,
+        mac_identity: None,
     };
     save_store_atomic(path, &store)?;
     Ok(store)
@@ -994,6 +1092,88 @@ mod tests {
         assert!(validate_code_secret(&secret, &code, &b64));
         assert!(!validate_code_secret(&secret, &code, "wrong"));
         assert!(!validate_code_secret(&[0x43u8; 32], &code, &b64));
+    }
+
+    #[test]
+    fn mac_identity_format() {
+        for _ in 0..500 {
+            let m = MacIdentity::generate();
+            assert_eq!(m.serial_number.len(), 12, "{}", m.serial_number);
+            assert!(is_valid_mac_serial(&m.serial_number), "{}", m.serial_number);
+            assert!(m.is_valid());
+            let u = uuid::Uuid::parse_str(&m.unique_device_id).unwrap();
+            assert_eq!(u.get_version_num(), 4);
+            assert_eq!(m.unique_device_id, m.unique_device_id.to_uppercase());
+            assert_eq!(m.unique_device_id.len(), 36);
+        }
+        assert!(!is_valid_mac_serial("C02ABCDEFGHI"));
+        assert!(!is_valid_mac_serial("F17XK0QXHG7F"));
+        assert!(!is_valid_mac_serial("C02C1ABCDNC"));
+        assert!(!is_valid_mac_serial("C02C1ABCDNé"));
+    }
+
+    #[test]
+    fn mac_identity_stable_across_restarts() {
+        let dir = temp_dir("macid");
+        let first = RelayHub::load_or_init(&dir).unwrap();
+        let id1 = first.mac_identity.clone();
+        // Saving the code must keep the identity.
+        first.save_store(Some("AAAA-BBBB-CCCC-DDDD".into())).unwrap();
+        drop(first);
+        let second = RelayHub::load_or_init(&dir).unwrap();
+        assert_eq!(second.mac_identity, id1);
+        assert_eq!(second.provider_code().as_deref(), Some("AAAA-BBBB-CCCC-DDDD"));
+
+        // A store from before this field existed gets an identity added, keeping token + code.
+        let path = dir.join("relay_provider.json");
+        fs::write(&path, r#"{"provider_token":"abc123","code":"WWWW-XXXX-YYYY-ZZZZ"}"#).unwrap();
+        let migrated = RelayHub::load_or_init(&dir).unwrap();
+        assert_eq!(migrated.provider_token, "abc123");
+        assert_eq!(migrated.provider_code().as_deref(), Some("WWWW-XXXX-YYYY-ZZZZ"));
+        assert!(migrated.mac_identity.is_valid());
+        let saved: ProviderStore =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.mac_identity.as_ref(), Some(&migrated.mac_identity));
+        assert_eq!(RelayHub::load_or_init(&dir).unwrap().mac_identity, migrated.mac_identity);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mac_identity_rewrites_only_serial_and_udid() {
+        let m = MacIdentity {
+            serial_number: "C02J1ABCDNCT".into(),
+            unique_device_id: "6F1C2E1A-0B6C-4C55-9E0B-6B7E2C8D9A10".into(),
+        };
+        let mut v = serde_json::json!({
+            "versions": {
+                "hardware_version": "iPhone8,1",
+                "software_name": "iPhone OS",
+                "software_version": "12.5.8",
+                "software_build_id": "16H88",
+                "unique_device_id": "0123456789abcdef0123456789abcdef01234567",
+                "serial_number": "F17XK0QXHG7F",
+                "extra": 1
+            }
+        });
+        m.apply_to_versions(&mut v);
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "versions": {
+                    "hardware_version": "iPhone8,1",
+                    "software_name": "iPhone OS",
+                    "software_version": "12.5.8",
+                    "software_build_id": "16H88",
+                    "unique_device_id": "6F1C2E1A-0B6C-4C55-9E0B-6B7E2C8D9A10",
+                    "serial_number": "C02J1ABCDNCT",
+                    "extra": 1
+                }
+            })
+        );
+        // Responses without `versions` pass through unchanged.
+        let mut other = serde_json::json!({"data": "abc"});
+        m.apply_to_versions(&mut other);
+        assert_eq!(other, serde_json::json!({"data": "abc"}));
     }
 
     #[tokio::test]
@@ -1116,7 +1296,16 @@ mod tests {
             .await
             .unwrap();
         assert!(r1.starts_with("HTTP/1.1 200"), "got: {}", r1);
-        assert!(r1.contains("iPhone10,6"), "got: {}", r1);
+        let body1 = r1.split_once("\r\n\r\n").unwrap().1;
+        let v1: serde_json::Value = serde_json::from_str(body1).unwrap();
+        let versions = &v1["versions"];
+        assert_eq!(versions["hardware_version"], "iPhone10,6");
+        assert_eq!(versions["software_name"], "iPhone OS");
+        assert_eq!(versions["software_version"], "16.7.2");
+        assert_eq!(versions["software_build_id"], "20H115");
+        assert_eq!(versions["serial_number"], hub.mac_identity.serial_number.as_str());
+        assert_eq!(versions["unique_device_id"], hub.mac_identity.unique_device_id.as_str());
+        assert!(!body1.contains("TESTSERIAL") && !body1.contains("TEST-UUID"), "got: {}", body1);
 
         // 4. Call public bridge for get-validation-data -> provider error becomes HTTP 502.
         let mut c2 = tokio::net::TcpStream::connect(pub_addr).await.unwrap();
