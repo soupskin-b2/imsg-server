@@ -1,7 +1,7 @@
 # imsg-server
 
 An iMessage bridge for flip phones. The server talks to Apple through
-[rustpush](https://github.com/OpenBubbles/rustpush), hosts its own beepserv registration relay on
+[rustpush](https://github.com/OpenBubbles/rustpush), hosts its own registration relay on
 the same TLS port, and keeps a small, low-power TLS push connection open to each paired phone. The
 phone side ships in
 [Messages Improved](https://github.com/thooton/wave_packages/tree/master/mods/messages) for the
@@ -17,8 +17,8 @@ SMS.
 - A Linux server reachable from the internet on port 443, with a domain name pointing at it.
 - A TLS certificate for that domain from a public CA (for example Let's Encrypt). Both the flip
   phone and the iPhone check it against their built-in trusted CAs.
-- A jailbroken iPhone running [beepserv](https://github.com/beeper/phone-registration-provider)
-  signed in to iMessage/FaceTime, which supplies iOS validation data to this server's built-in relay.
+- A jailbroken iPhone running [OpenBubbles/relayserver](https://github.com/OpenBubbles/relayserver),
+  which supplies iOS validation data to this server's built-in relay.
 - The flip phone, with the SIM for the number you want to use.
 
 ## Install
@@ -54,25 +54,29 @@ sudo imsg-server init --domain imsg.example.com
 ```
 
 `init` writes `config.toml` (using the Let's Encrypt certificate paths for `--domain` unless you
-pass `--cert` and `--key`), initializes the built-in relay credentials, and prints the provider URL
-for beepserv:
+pass `--cert` and `--key`), initializes the built-in relay credentials, and prints the WebSocket
+provider URL for `OpenBubbles/relayserver`:
 
 ```text
-https://imsg.example.com/api/v1/provider?t=<token>
+wss://imsg.example.com/api/v1/provider?t=<token>
 ```
 
-On the jailbroken iPhone (rootless palera1n), write that URL on a single line to
-`/var/jb/.beepserv_wsurl` and restart `identityservicesd` (**do not reboot**, or palera1n will drop
-the jailbreak):
+On the jailbroken iPhone (SSH into the phone as `root` or `mobile`), write `/var/mobile/config.json`
+with that URL and restart the `relayserver` LaunchDaemon (`KeepAlive` restarts it automatically
+when killed):
 
 ```sh
-echo 'https://imsg.example.com/api/v1/provider?t=<token>' > /var/jb/.beepserv_wsurl
-killall identityservicesd
+printf '{"url":"wss://imsg.example.com/api/v1/provider?t=<token>","state":null}\n' > /var/mobile/config.json
+killall relayserver
 ```
 
-You can print the URL again at any time with `sudo imsg-server relay-url`. When beepserv connects
-for the first time (including when migrating from Beeper's relay), the built-in relay issues it a
-fresh code and secret automatically and locks to that single provider.
+(Or reload it explicitly with `launchctl unload /Library/LaunchDaemons/dev.copper.relayserver.plist
+&& launchctl load /Library/LaunchDaemons/dev.copper.relayserver.plist`.)
+
+You can print the URL again at any time with `sudo imsg-server relay-url`. When `relayserver`
+connects for the first time (or migrates from Beeper's relay), the built-in relay issues it a fresh
+code and secret automatically, `relayserver` saves them into `/var/mobile/config.json`, and
+`imsg-server` locks to that single provider.
 
 Next, pair the flip phone:
 
@@ -148,7 +152,7 @@ Everything the server keeps lives next to `config.toml`. Keep these private and 
 ## Testing without Apple
 
 `imsg-server run --no-apple` (or `pair --no-apple`) skips Apple. It still runs the built-in relay
-(so you can test beepserv connectivity), simulates phone-number setup (any `REG-RESP` is accepted),
+(so you can test `relayserver` connectivity), simulates phone-number setup (any `REG-RESP` is accepted),
 and echoes every sent message back.
 
 ## License

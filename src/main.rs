@@ -37,7 +37,7 @@ struct Cli {
 enum Commands {
     /// Write a new config.toml and initialize built-in relay credentials
     Init {
-        /// Host name phones and beepserv connect to; must match your TLS certificate
+        /// Host name phones and relayserver connect to; must match your TLS certificate
         #[arg(long)]
         domain: String,
         /// Certificate chain (default: Let's Encrypt fullchain.pem for --domain)
@@ -54,7 +54,7 @@ enum Commands {
         renewal_lead_days: u64,
     },
 
-    /// Print the built-in relay provider URL for beepserv on the jailbroken iPhone
+    /// Print the built-in relay provider URL for OpenBubbles/relayserver on the jailbroken iPhone
     RelayUrl,
 
     /// Show a one-time code for pairing a phone (starts the server if it isn't running)
@@ -340,7 +340,7 @@ async fn run_server(cfg: Config, no_apple: bool) -> Result<()> {
     if let Some(code) = relay.provider_code() {
         info!("built-in relay ready (locked provider code {})", code);
     } else {
-        info!("built-in relay ready; run `imsg-server relay-url` to configure beepserv on your iPhone");
+        info!("built-in relay ready; run `imsg-server relay-url` to configure OpenBubbles/relayserver on your iPhone");
     }
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingClientMsg>(256);
@@ -375,13 +375,16 @@ fn already_running(cfg: &Config) -> bool {
 fn print_relay_instructions(cfg: &Config, relay: &RelayHub) {
     let url = relay.provider_url(&cfg.phone_address());
     println!();
-    println!("Built-in registration relay URL (for beepserv on your jailbroken iPhone):");
+    println!("Built-in registration relay URL (for OpenBubbles/relayserver on your jailbroken iPhone):");
     println!();
     println!("  {}", url);
     println!();
-    println!("On the iPhone (rootless palera1n), write that URL to /var/jb/.beepserv_wsurl and run:");
-    println!("  killall identityservicesd");
-    println!("(Do not reboot the iPhone, or palera1n will drop the jailbreak.)");
+    println!("On the jailbroken iPhone, write /var/mobile/config.json and restart relayserver:");
+    println!(
+        "  printf '{{\"url\":\"{}\",\"state\":null}}\\n' > /var/mobile/config.json",
+        url
+    );
+    println!("  killall relayserver");
     if let Some(code) = relay.provider_code() {
         println!();
         println!("Locked provider code: {}", code);
@@ -416,7 +419,7 @@ async fn main() -> Result<()> {
             println!("Wrote {}", cli.config.display());
             print_relay_instructions(&cfg, &relay);
             println!();
-            println!("Next: point beepserv at the URL above, then run `imsg-server pair`.");
+            println!("Next: point OpenBubbles/relayserver at the URL above, then run `imsg-server pair`.");
         }
         Commands::RelayUrl => {
             let cfg = Config::load(&cli.config)?;

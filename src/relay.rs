@@ -1,7 +1,7 @@
-//! Built-in registration relay (beepserv provider WebSocket + bridge HTTP API).
+//! Built-in registration relay (OpenBubbles/relayserver provider WebSocket + bridge HTTP API).
 //!
 //! Serves the same HTTP/1.1 protocol as `beeper/registration-relay`:
-//!   - `GET /api/v1/provider?t=<token>` (WebSocket upgrade for beepserv on the jailbroken iPhone)
+//!   - `GET /api/v1/provider?t=<token>` (WebSocket upgrade for OpenBubbles/relayserver on the jailbroken iPhone)
 //!   - `POST /api/v1/bridge/{get-version-info|get-validation-data}` (`Authorization: Bearer <code>`)
 //!   - `GET /health`
 //!
@@ -44,8 +44,10 @@ type HmacSha256 = Hmac<Sha256>;
 const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-const PING_INTERVAL: Duration = Duration::from_secs(45);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// OpenBubbles/relayserver sends an app-level `ping` every 60s (and panics/disconnects on
+/// server-initiated pings or WS Ping frames), so we passively enforce a 3x idle timeout.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 const AUTH_WINDOW: Duration = Duration::from_secs(60);
 const MAX_AUTH_FAILURES_PER_WINDOW: usize = 20;
 
@@ -74,7 +76,7 @@ struct ProviderStore {
 struct IncomingWsMsg {
     command: String,
     #[serde(default)]
-    id: i64,
+    id: Option<i64>,
     #[serde(default)]
     data: serde_json::Value,
 }
@@ -179,10 +181,10 @@ impl RelayHub {
         })
     }
 
-    /// URL to put in `/var/jb/.beepserv_wsurl` on the jailbroken iPhone.
+    /// WebSocket URL for OpenBubbles/relayserver (`/var/mobile/config.json` `"url"` field).
     pub fn provider_url(&self, phone_address: &str) -> String {
         format!(
-            "https://{}/api/v1/provider?t={}",
+            "wss://{}/api/v1/provider?t={}",
             phone_address, self.provider_token
         )
     }
@@ -604,7 +606,7 @@ impl RelayHub {
 
         let reply = OutgoingWsMsg {
             command: "response",
-            id: Some(incoming.id),
+            id: incoming.id,
             data: Some(RegisterResponseData {
                 code: code.clone(),
                 secret,
@@ -624,8 +626,8 @@ impl RelayHub {
             return;
         }
 
-        let mut ping_tick = tokio::time::interval(PING_INTERVAL);
-        ping_tick.tick().await; // consume immediate tick
+        let mut idle_tick = tokio::time::interval(IDLE_CHECK_INTERVAL);
+        idle_tick.tick().await; // consume immediate tick
         let mut last_rx = Instant::now();
 
         loop {
@@ -644,21 +646,14 @@ impl RelayHub {
                         }
                     }
                 }
-                _ = ping_tick.tick() => {
+                _ = idle_tick.tick() => {
                     if last_rx.elapsed() >= IDLE_TIMEOUT {
-                        warn!("relay provider {} timed out (no traffic for {}s)", peer, IDLE_TIMEOUT.as_secs());
+                        warn!(
+                            "relay provider {} timed out (no traffic for {}s)",
+                            peer,
+                            IDLE_TIMEOUT.as_secs()
+                        );
                         let _ = ws_sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                    // Send app-level ping (beepserv answers with `{"command":"pong"}`) + WS Ping.
-                    let ping_json = serde_json::to_string(&OutgoingWsMsg::<()> {
-                        command: "ping",
-                        id: None,
-                        data: None,
-                    }).unwrap();
-                    if ws_sink.send(Message::Text(ping_json)).await.is_err()
-                        || ws_sink.send(Message::Ping(Vec::new())).await.is_err()
-                    {
                         break;
                     }
                 }
@@ -671,7 +666,7 @@ impl RelayHub {
                                     "ping" => {
                                         let pong = serde_json::to_string(&OutgoingWsMsg::<()> {
                                             command: "pong",
-                                            id: Some(msg.id),
+                                            id: msg.id,
                                             data: None,
                                         }).unwrap();
                                         if ws_sink.send(Message::Text(pong)).await.is_err() {
@@ -679,7 +674,7 @@ impl RelayHub {
                                         }
                                     }
                                     "pong" => {
-                                        // beepserv replies `{"command":"pong"}` without an id.
+                                        // Ignore unsolicited pong frames.
                                     }
                                     "response" => {
                                         let now_ms = now_epoch_ms();
@@ -688,15 +683,17 @@ impl RelayHub {
                                         });
                                         let taken = conn.waiter.lock().expect("waiter poisoned").take();
                                         if let Some((expected_id, tx)) = taken {
-                                            if msg.id != 0 && msg.id != expected_id {
-                                                warn!(
-                                                    "relay provider response id={} != expected {}; delivering anyway",
-                                                    msg.id, expected_id
-                                                );
+                                            if let Some(got_id) = msg.id {
+                                                if got_id != 0 && got_id != expected_id {
+                                                    warn!(
+                                                        "relay provider response id={} != expected {}; delivering anyway",
+                                                        got_id, expected_id
+                                                    );
+                                                }
                                             }
                                             let _ = tx.send(msg.data);
                                         } else {
-                                            warn!("relay provider sent unsolicited response id={}", msg.id);
+                                            warn!("relay provider sent unsolicited response id={:?}", msg.id);
                                         }
                                     }
                                     other => {
@@ -1029,15 +1026,15 @@ mod tests {
             .unwrap();
         assert!(resp_buf.starts_with("HTTP/1.1 401"), "got: {}", resp_buf);
 
-        // 2. Connect mock beepserv provider over WebSocket with foreign Beeper credentials.
+        // 2. Connect mock OpenBubbles/relayserver provider over WebSocket with explicit `"id": null`
+        //    and foreign Beeper credentials (also verify `"ping"` with `"id": null, "data": null`).
         let ws_url = format!(
             "ws://{}/api/v1/provider?t={}",
             pub_addr, hub.provider_token
         );
         let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-        // Send register without `id` (matching beepserv Tweak.x) and with bogus old Beeper code.
         ws.send(Message::Text(
-            r#"{"command":"register","data":{"code":"AAAA-BBBB-CCCC-DDDD","secret":"notvalid"}}"#
+            r#"{"command":"register","id":null,"data":{"code":"AAAA-BBBB-CCCC-DDDD","secret":"notvalid"}}"#
                 .to_string(),
         ))
         .await
@@ -1054,6 +1051,18 @@ mod tests {
         assert_ne!(issued_code, "AAAA-BBBB-CCCC-DDDD");
         assert!(validate_code_secret(&hub.secret, &issued_code, &issued_secret));
         assert!(hub.status().provider_connected);
+
+        // Verify OpenBubbles/relayserver's 60s ping format (`"id": null, "data": null`).
+        ws.send(Message::Text(
+            r#"{"command":"ping","id":null,"data":null}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let pong_reply = match ws.next().await.unwrap().unwrap() {
+            Message::Text(t) => serde_json::from_str::<serde_json::Value>(&t).unwrap(),
+            other => panic!("expected pong text frame, got {:?}", other),
+        };
+        assert_eq!(pong_reply["command"], "pong");
 
         // Spawn mock provider responder loop.
         let provider_task = tokio::spawn(async move {

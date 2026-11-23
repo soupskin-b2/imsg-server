@@ -771,7 +771,7 @@ async fn activate(cfg: &Config, internal_relay: &(String, String)) -> Result<Act
             .await
             .map_err(|e| match e {
                 PushError::DeviceNotFound => anyhow!(
-                    "Built-in relay has no iPhone provider connected. Check beepserv on your iPhone."
+                    "Built-in relay has no iPhone provider connected. Check relayserver on your iPhone."
                 ),
                 other => anyhow!("Built-in relay error: {}", other),
             })?;
