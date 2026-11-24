@@ -349,12 +349,19 @@ async fn run_echo_backend(
     let mut connect_rx = hub.subscribe_connects();
     let mut last_echo_id: Option<String> = None;
     let mut echo_group: Option<(Vec<String>, String)> = None;
+    let mut relay_connected = relay.status().provider_connected;
 
     loop {
         tokio::select! {
             changed = relay_status_rx.changed() => {
                 if changed.is_ok() {
+                    // Only a change the phone shows (each REG_INFO wakes it); the relay status
+                    // also changes on every answered validation request.
                     let connected = relay_status_rx.borrow().provider_connected;
+                    if connected == relay_connected {
+                        continue;
+                    }
+                    relay_connected = connected;
                     let info = echo_reg_info(&handle, fake_expires_ms, cfg.renewal.lead_days, connected);
                     if let Ok(encoded) = info.encode() {
                         hub.deliver_connected(encoded).await;

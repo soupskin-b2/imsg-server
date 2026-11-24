@@ -2,7 +2,7 @@ use crate::body::{
     AppBody, InAttachment, OutAttachment, ATTACH_AUDIO, ATTACH_FILE, ATTACH_IMAGE, ATTACH_STICKER,
     ATTACH_VCARD, ATTACH_VIDEO, ATTACH_VOICE, GROUP_ICON, GROUP_PARTICIPANTS, GROUP_RENAMED,
     REACT_DISLIKE, REACT_EMOJI, REACT_EMPHASIZE, REACT_HEART, REACT_LAUGH, REACT_LIKE,
-    REACT_QUESTION, REACT_STICKER, RECEIPT_DELIVERED, RECEIPT_READ, REG_STATE_FAILED,
+    REACT_QUESTION, REACT_STICKER, REG_STATE_FAILED,
     REG_STATE_NEEDS_PHONE, REG_STATE_OK, REG_STATE_RENEWING, SETUP_FAILED, SETUP_NEED_SIM,
     SETUP_READY, SETUP_WAITING_SMS, SETUP_WORKING,
 };
@@ -96,11 +96,17 @@ impl AppleStatusTracker {
         }
     }
 
+    /// Takes the relay's status; true if the phone's view of it (REG_INFO) changed. The last
+    /// answer time changes on every validation request the iPhone answers but isn't in REG_INFO,
+    /// so it's only saved (apple_status.json), not pushed: an identical REG_INFO wakes the phone.
     fn update_relay(&mut self, rs: &RelayStatus) -> bool {
-        let changed = self.provider_connected != rs.provider_connected
-            || self.provider_last_answered_ms != rs.last_answered_ms;
+        let changed = self.provider_connected != rs.provider_connected;
+        let answered = self.provider_last_answered_ms != rs.last_answered_ms;
         self.provider_connected = rs.provider_connected;
         self.provider_last_answered_ms = rs.last_answered_ms;
+        if answered && !changed {
+            self.save();
+        }
         changed
     }
 
@@ -1155,33 +1161,29 @@ async fn bridge_session(
                     if i.file.is_some() { "set".to_string() } else { String::new() },
                     Vec::new(),
                 )),
-                Message::Delivered => Some(AppBody::Receipt {
-                    kind: RECEIPT_DELIVERED,
-                    apple_msg_id: inst.id.clone(),
-                    sender: sender.clone(),
-                    timestamp_ms: ts_ms,
-                }),
-                Message::Read => Some(AppBody::Receipt {
-                    kind: RECEIPT_READ,
-                    apple_msg_id: inst.id.clone(),
-                    sender: sender.clone(),
-                    timestamp_ms: ts_ms,
-                }),
+                // Delivered/read receipts for what the phone sent aren't shown there, and each
+                // one would wake it (CPU and radio), up to twice per sent message: dropped here.
+                Message::Delivered | Message::Read => {
+                    debug!("[apple] receipt {} from {} not forwarded", inst.id, sender);
+                    None
+                }
                 _ => {
                     debug!("[apple] ignoring message id={} (not shown on the phone)", inst.id);
                     None
                 }
             };
-            let Some(body) = body else { continue };
-
-            // Persist to client outbox(es) BEFORE certifying delivery to Apple.
-            match body.encode() {
-                Ok(encoded) => {
-                    let _ = rx_hub.deliver_all(encoded).await;
-                }
-                Err(e) => {
-                    warn!("failed to encode body for {}: {:#}", inst.id, e);
-                    continue;
+            // Persist to client outbox(es) BEFORE certifying delivery to Apple. What isn't
+            // forwarded (receipts, kinds the phone doesn't show) is handled all the same, so it's
+            // certified too: Apple resends what isn't, which would only wake us again.
+            if let Some(body) = body {
+                match body.encode() {
+                    Ok(encoded) => {
+                        let _ = rx_hub.deliver_all(encoded).await;
+                    }
+                    Err(e) => {
+                        warn!("failed to encode body for {}: {:#}", inst.id, e);
+                        continue;
+                    }
                 }
             }
 
