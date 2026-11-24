@@ -1981,13 +1981,14 @@ async fn send_and_confirm(im_client: &IMClient, inst: &mut MessageInst) -> Resul
     Ok(())
 }
 
-/// Uploads one attachment (converted for iPhones) to Apple.
+/// Uploads one attachment (converted for iPhones) to Apple; true if it became an audio message.
 async fn upload_attachment(
     conn: &APSConnection,
     media: &MediaStore,
     a: &OutAttachment,
-) -> Result<Attachment> {
-    let out = media.prepare_outgoing(&a.upload_id, &a.name, &a.mime).await?;
+    allow_voice: bool,
+) -> Result<(Attachment, bool)> {
+    let out = media.prepare_outgoing(&a.upload_id, &a.name, &a.mime, allow_voice).await?;
     let prepared = MMCSFile::prepare_put(fs::File::open(&out.path)?)
         .await
         .map_err(|e| anyhow!("preparing {} for Apple failed: {}", out.name, e))?;
@@ -2003,7 +2004,7 @@ async fn upload_attachment(
     .await
     .map_err(|e| anyhow!("uploading {} to Apple failed: {}", out.name, e))?;
     info!("uploaded {} ({}, {} bytes) to Apple", out.name, out.mime, att.get_size());
-    Ok(att)
+    Ok((att, out.voice))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2020,14 +2021,19 @@ async fn send_imessage(
     let out = outgoing_conversation(im_client, preferred_handle, raw_targets, sender_guid, true).await?;
 
     let mut parts = Vec::with_capacity(attachments.len() + 1);
+    // A recording sent on its own goes as an audio message, as an iPhone sends one.
+    let allow_voice = attachments.len() == 1 && text.trim().is_empty();
+    let mut voice = false;
     for a in attachments {
+        let (att, is_voice) = upload_attachment(conn, media, a, allow_voice).await?;
+        voice |= is_voice;
         parts.push(IndexedMessagePart {
-            part: MessagePart::Attachment(upload_attachment(conn, media, a).await?),
+            part: MessagePart::Attachment(att),
             idx: None,
             ext: None,
         });
     }
-    if !text.is_empty() || parts.is_empty() {
+    if (!voice && !text.is_empty()) || parts.is_empty() {
         parts.push(IndexedMessagePart {
             part: MessagePart::Text(text, Default::default()),
             idx: None,
@@ -2036,14 +2042,16 @@ async fn send_imessage(
     }
     let mut nm = NormalMessage::new(String::new(), MessageType::IMessage);
     nm.parts = MessageParts(parts);
+    nm.voice = voice;
 
     let mut inst = MessageInst::new(out.conv, &out.me, Message::Message(nm));
     info!(
-        "[client->apple] sending iMessage id={} from={} to={:?} attachments={}",
+        "[client->apple] sending iMessage id={} from={} to={:?} attachments={} voice={}",
         inst.id,
         out.me,
         out.targets,
-        attachments.len()
+        attachments.len(),
+        voice
     );
     send_and_confirm(im_client, &mut inst).await?;
     Ok(inst.id)

@@ -20,7 +20,9 @@ What crosses the bridge:
   attachment from Apple and gives the phone a screen-size preview it can show: JPEG or PNG at
   most 640 px (HEIC decoded), 240p H.264 video, AAC audio. "Save attachment" on the phone fetches
   the full-size file (HEIC becomes a full-resolution JPEG, HEVC video becomes H.264). What the
-  phone sends (JPEG, 3GP, AMR) is converted to what iPhones show inline. Other files arrive as
+  phone sends (JPEG, 3GP, AMR) is converted to what iPhones show inline; a voice recording sent on
+  its own arrives as an iPhone audio message (`Audio Message.caf`, Opus), so like any audio message
+  it may expire on the iPhone unless kept. Other files arrive as
   `[File: name, size]`.
 - **Tapbacks**, shown as badges on the message, both ways (the phone sends the six standard ones).
 - **Edits** (`... (edited)`, earlier versions kept), **unsends** (the message stays, marked

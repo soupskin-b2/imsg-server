@@ -192,6 +192,15 @@ pub struct Outgoing {
     pub name: String,
     pub mime: String,
     pub uti: String,
+    /// A voice recording, converted to an iPhone audio message (`Audio Message.caf`, Opus).
+    pub voice: bool,
+}
+
+/// What the phone's recorder makes ("Record audio" in Messages): AMR in AMR or 3GPP files.
+pub fn is_phone_voice_recording(mime: &str, name: &str) -> bool {
+    let m = mime.to_ascii_lowercase();
+    matches!(m.as_str(), "audio/amr" | "audio/amr-wb" | "audio/3gpp" | "audio/3gpp2" | "audio/3gp")
+        || matches!(ext_of(name).as_str(), "amr" | "awb" | "3ga")
 }
 
 pub struct MediaStore {
@@ -291,6 +300,7 @@ pub fn uti_for_mime(mime: &str) -> &'static str {
         "image/gif" => "com.compuserve.gif",
         "video/mp4" => "public.mpeg-4",
         "audio/mp4" => "public.mpeg-4-audio",
+        "audio/x-caf" | "audio/caf" => "com.apple.coreaudio-format",
         "text/vcard" | "text/x-vcard" => "public.vcard",
         "text/plain" => "public.plain-text",
         _ => "public.data",
@@ -593,7 +603,9 @@ impl MediaStore {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to start {}", prog))?;
+            // A converter that isn't installed (yet) is the server's problem, not the file's:
+            // let the phone try again later instead of giving up on the attachment.
+            .map_err(|e| anyhow::Error::new(TryLater(format!("failed to start {}: {}", prog, e))))?;
         let out = tokio::time::timeout(CONVERT_TIMEOUT, child.wait_with_output())
             .await
             .map_err(|_| anyhow!("{} timed out", prog))??;
@@ -885,14 +897,38 @@ impl MediaStore {
     }
 
     /// Converts upload `upload_id` into something an iPhone shows inline.
-    pub async fn prepare_outgoing(&self, upload_id: &str, name: &str, mime: &str) -> Result<Outgoing> {
+    /// With `allow_voice`, a phone voice recording becomes an iPhone audio message (`Audio Message.caf`).
+    pub async fn prepare_outgoing(
+        &self,
+        upload_id: &str,
+        name: &str,
+        mime: &str,
+        allow_voice: bool,
+    ) -> Result<Outgoing> {
         let src = self.upload_path(upload_id)?;
         if !src.is_file() {
             bail!("attachment upload {} is missing", upload_id);
         }
-        let mime = mime.to_ascii_lowercase();
+        let mime = mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase();
         let stem = stem_of(name);
         let out_with = |ext: &str| src.with_extension(format!("out.{}", ext));
+        if allow_voice && is_phone_voice_recording(&mime, name) {
+            // iPhones show an audio message (play button, waveform) only for Core Audio files;
+            // iOS records them as Opus in CAF. Anything else arrives as a plain audio file.
+            let out = out_with("caf");
+            match self.ffmpeg(voice_args(&src, &out)).await {
+                Ok(()) => {
+                    return Ok(Outgoing {
+                        path: out,
+                        name: "Audio Message.caf".to_string(),
+                        mime: "audio/x-caf".to_string(),
+                        uti: "com.apple.coreaudio-format".to_string(),
+                        voice: true,
+                    });
+                }
+                Err(e) => warn!("converting voice recording {} to CAF failed ({:#}); sending it as M4A", upload_id, e),
+            }
+        }
         let (path, name, mime) = match mime.as_str() {
             "image/jpeg" | "image/jpg" => (src.clone(), format!("{}.jpg", stem), "image/jpeg".to_string()),
             "image/png" => (src.clone(), format!("{}.png", stem), mime.clone()),
@@ -914,7 +950,7 @@ impl MediaStore {
                     .await?;
                 (out, format!("{}.mp4", stem), "video/mp4".to_string())
             }
-            m if m.starts_with("audio/") && m != "audio/mp4" && m != "audio/mpeg" => {
+            m if (m.starts_with("audio/") || m == "application/ogg") && m != "audio/mp4" && m != "audio/mpeg" => {
                 let out = out_with("m4a");
                 self.ffmpeg(audio_args(&src, &out, "64k")).await?;
                 (out, format!("{}.m4a", stem), "audio/mp4".to_string())
@@ -923,7 +959,7 @@ impl MediaStore {
             _ => (src.clone(), name.to_string(), mime.clone()),
         };
         let uti = uti_for_mime(&mime).to_string();
-        Ok(Outgoing { path, name, mime, uti })
+        Ok(Outgoing { path, name, mime, uti, voice: false })
     }
 
     /// Deletes upload `id` and anything converted from it.
@@ -1022,6 +1058,18 @@ fn video_args(
         "-crf".into(), crf.into(), "-maxrate".into(), maxrate.into(), "-bufsize".into(), bufsize,
         "-c:a".into(), "aac".into(), "-b:a".into(), audio_rate.into(), "-ac".into(), "2".into(),
         "-movflags".into(), "+faststart".into(),
+        out.to_string_lossy().into_owned(),
+    ]
+}
+
+/// A voice recording as iOS records audio messages: Opus, 24 kHz mono, in CAF.
+fn voice_args(input: &Path, out: &Path) -> Vec<String> {
+    vec![
+        "-i".into(), input.to_string_lossy().into_owned(),
+        "-vn".into(), "-map_metadata".into(), "-1".into(),
+        "-c:a".into(), "libopus".into(), "-application".into(), "voip".into(),
+        "-b:a".into(), "24k".into(), "-ar".into(), "24000".into(), "-ac".into(), "1".into(),
+        "-f".into(), "caf".into(),
         out.to_string_lossy().into_owned(),
     ]
 }
