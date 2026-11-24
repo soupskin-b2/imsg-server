@@ -16,7 +16,7 @@ use crate::body::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, info, warn};
-use rustpush::{APSConnection, Attachment, AttachmentType};
+use rustpush::{APSConnection, Attachment, AttachmentType, MMCSFile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -54,7 +54,81 @@ struct Meta {
     size: u64,
     /// How to fetch the original from Apple again (kept until the original is on disk).
     #[serde(default)]
-    attachment: Option<Attachment>,
+    attachment: Option<StoredAttachment>,
+}
+
+/// A copy of rustpush's `Attachment` that survives JSON. rustpush's own serde writes its byte
+/// fields with `serialize_bytes` (a JSON number array) but reads them back only as plist data,
+/// so an `Attachment` written to meta.json could never be loaded again: every incoming photo,
+/// video and voice message failed with "invalid type: sequence, expected a byte array". The
+/// JSON shape is the same as before, so meta.json files written by older versions load too.
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredAttachment {
+    a_type: StoredAttachmentType,
+    part: u64,
+    uti_type: String,
+    mime: String,
+    name: String,
+    iris: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+enum StoredAttachmentType {
+    Inline(Vec<u8>),
+    MMCS(StoredMmcsFile),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredMmcsFile {
+    signature: Vec<u8>,
+    object: String,
+    url: String,
+    key: Vec<u8>,
+    size: usize,
+}
+
+impl From<&Attachment> for StoredAttachment {
+    fn from(a: &Attachment) -> Self {
+        Self {
+            a_type: match &a.a_type {
+                AttachmentType::Inline(data) => StoredAttachmentType::Inline(data.clone()),
+                AttachmentType::MMCS(m) => StoredAttachmentType::MMCS(StoredMmcsFile {
+                    signature: m.signature.clone(),
+                    object: m.object.clone(),
+                    url: m.url.clone(),
+                    key: m.key.clone(),
+                    size: m.size,
+                }),
+            },
+            part: a.part,
+            uti_type: a.uti_type.clone(),
+            mime: a.mime.clone(),
+            name: a.name.clone(),
+            iris: a.iris,
+        }
+    }
+}
+
+impl StoredAttachment {
+    fn to_attachment(&self) -> Attachment {
+        Attachment {
+            a_type: match &self.a_type {
+                StoredAttachmentType::Inline(data) => AttachmentType::Inline(data.clone()),
+                StoredAttachmentType::MMCS(m) => AttachmentType::MMCS(MMCSFile {
+                    signature: m.signature.clone(),
+                    object: m.object.clone(),
+                    url: m.url.clone(),
+                    key: m.key.clone(),
+                    size: m.size,
+                }),
+            },
+            part: self.part,
+            uti_type: self.uti_type.clone(),
+            mime: self.mime.clone(),
+            name: self.name.clone(),
+            iris: self.iris,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +356,17 @@ impl MediaStore {
         } else {
             att.name.clone()
         };
+        // Inline attachments (voice messages and other small files) arrive with the message:
+        // keep the bytes as the original right away instead of in meta.json.
+        let attachment = match &att.a_type {
+            AttachmentType::Inline(data) => {
+                let tmp = dir.join("original.part");
+                fs::write(&tmp, data)?;
+                fs::rename(&tmp, dir.join("original"))?;
+                None
+            }
+            AttachmentType::MMCS(_) => Some(StoredAttachment::from(att)),
+        };
         let meta = Meta {
             name: name.clone(),
             mime: att.mime.clone(),
@@ -289,7 +374,7 @@ impl MediaStore {
             kind,
             created_ms: now_ms(),
             size: att.get_size() as u64,
-            attachment: Some(att.clone()),
+            attachment,
         };
         Self::write_json(&dir.join("meta.json"), &meta)?;
         if kind != ATTACH_FILE {
@@ -394,7 +479,8 @@ impl MediaStore {
         let att = meta
             .attachment
             .as_ref()
-            .ok_or_else(|| anyhow!("attachment is no longer available"))?;
+            .ok_or_else(|| anyhow!("attachment is no longer available"))?
+            .to_attachment();
         let tmp = path.with_extension("part");
         match &att.a_type {
             AttachmentType::Inline(data) => fs::write(&tmp, data)?,
@@ -930,6 +1016,141 @@ mod tests {
         assert_eq!(p.width, 1920);
         let png = Probe::parse(br#"{"streams":[{"codec_type":"video","codec_name":"png","pix_fmt":"rgba"}]}"#);
         assert!(png.has_alpha());
+    }
+
+    fn sample_attachment(a_type: AttachmentType) -> Attachment {
+        Attachment {
+            a_type,
+            part: 0,
+            uti_type: "com.apple.coreaudio-format".into(),
+            mime: "audio/x-caf".into(),
+            name: "Audio Message.caf".into(),
+            iris: false,
+        }
+    }
+
+    fn sample_mmcs() -> AttachmentType {
+        AttachmentType::MMCS(MMCSFile {
+            signature: vec![9; 21],
+            object: "obj".into(),
+            url: "https://example.invalid/obj".into(),
+            key: vec![7; 32],
+            size: 3,
+        })
+    }
+
+    fn temp_store() -> (Arc<MediaStore>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("imsg-media-test-{}", Uuid::new_v4()));
+        (Arc::new(MediaStore::new(&dir, None, 30).unwrap()), dir)
+    }
+
+    #[test]
+    fn meta_with_attachment_round_trips() {
+        for a_type in [AttachmentType::Inline(vec![1, 2, 3]), sample_mmcs()] {
+            let meta = Meta {
+                name: "Audio Message.caf".into(),
+                mime: "audio/x-caf".into(),
+                uti: "com.apple.coreaudio-format".into(),
+                kind: ATTACH_VOICE,
+                created_ms: 1,
+                size: 3,
+                attachment: Some(StoredAttachment::from(&sample_attachment(a_type))),
+            };
+            let raw = serde_json::to_vec(&meta).unwrap();
+            let back: Meta = serde_json::from_slice(&raw).expect("meta.json must load again");
+            let att = back.attachment.unwrap().to_attachment();
+            assert_eq!(att.name, "Audio Message.caf");
+            match att.a_type {
+                AttachmentType::Inline(d) => assert_eq!(d, vec![1, 2, 3]),
+                AttachmentType::MMCS(m) => {
+                    assert_eq!(m.signature, vec![9; 21]);
+                    assert_eq!(m.key, vec![7; 32]);
+                    assert_eq!(m.url, "https://example.invalid/obj");
+                }
+            }
+        }
+    }
+
+    /// meta.json files written before the fix (rustpush's `Attachment` straight through
+    /// serde_json) still load, so attachments already on the server can be fetched again.
+    #[test]
+    fn legacy_meta_json_loads() {
+        #[derive(Serialize)]
+        struct LegacyMeta {
+            name: String,
+            mime: String,
+            uti: String,
+            kind: u8,
+            created_ms: u64,
+            size: u64,
+            attachment: Option<Attachment>,
+        }
+        for a_type in [AttachmentType::Inline(vec![4, 5]), sample_mmcs()] {
+            let legacy = LegacyMeta {
+                name: "IMG_1.HEIC".into(),
+                mime: "image/heic".into(),
+                uti: "public.heic".into(),
+                kind: ATTACH_IMAGE,
+                created_ms: 1,
+                size: 3,
+                attachment: Some(sample_attachment(a_type)),
+            };
+            // What the old code read back, and why every attachment failed:
+            let old = serde_json::to_vec(&legacy.attachment).unwrap();
+            assert!(serde_json::from_slice::<Option<Attachment>>(&old).is_err());
+            let raw = serde_json::to_vec(&legacy).unwrap();
+            let meta: Meta = serde_json::from_slice(&raw).expect("legacy meta.json must load");
+            match meta.attachment.unwrap().to_attachment().a_type {
+                AttachmentType::Inline(d) => assert_eq!(d, vec![4, 5]),
+                AttachmentType::MMCS(m) => assert_eq!(m.key, vec![7; 32]),
+            }
+        }
+    }
+
+    /// An MMCS attachment's meta loads again: fetching it gets as far as needing Apple.
+    #[tokio::test]
+    async fn mmcs_attachment_meta_is_usable() {
+        let (store, dir) = temp_store();
+        let att = sample_attachment(sample_mmcs());
+        let r = store.register_incoming(&att, true, false).unwrap();
+        assert_eq!(r.kind, ATTACH_VOICE);
+        let err = store.variant(&r.media_id, false).await.unwrap_err();
+        assert!(format!("{:#}", err).contains("not connected to Apple"), "{:#}", err);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An iPhone voice message (inline `Audio Message.caf`, Opus 24 kHz mono in CAF, as iOS
+    /// 12.2+ sends it) becomes an AAC preview and full file with the real ffmpeg.
+    #[tokio::test]
+    async fn inline_voice_message_converts() {
+        if which("ffmpeg").is_none() || which("ffprobe").is_none() {
+            eprintln!("ffmpeg not installed; skipping");
+            return;
+        }
+        let caf = include_bytes!("../testdata/audio_message_opus.caf").to_vec();
+        let (store, dir) = temp_store();
+        let att = sample_attachment(AttachmentType::Inline(caf.clone()));
+        let r = store.register_incoming(&att, true, false).unwrap();
+        assert_eq!(r.kind, ATTACH_VOICE);
+        assert_eq!(r.size, caf.len() as u64);
+        let meta = store.read_meta(&r.media_id).unwrap();
+        assert!(meta.attachment.is_none(), "inline bytes go to the original, not meta.json");
+        assert_eq!(fs::read(dir.join("media").join(&r.media_id).join("original")).unwrap(), caf);
+        for full in [false, true] {
+            let v = store.variant(&r.media_id, full).await.unwrap();
+            assert_eq!(v.mime, "audio/mp4");
+            assert_eq!(v.name, "Voice message.m4a");
+            assert!(v.len > 1000, "converted file is {} bytes", v.len);
+            let probe = Command::new("ffprobe")
+                .args(["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+                .arg(&v.path)
+                .output()
+                .await
+                .unwrap();
+            let out = String::from_utf8_lossy(&probe.stdout);
+            assert!(out.contains("aac"), "{}", out);
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

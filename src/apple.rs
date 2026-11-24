@@ -32,7 +32,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
 const IDENTITY_TAG: &str = "imsg-server";
@@ -116,8 +116,15 @@ impl AppleStatusTracker {
         self.next_rereg_at_ms = users_next_rereg_at_ms(users);
     }
 
-    fn renew_at_ms(&self) -> u64 {
+    /// When the proactive SMS renewal of the phone-number auth certificate starts.
+    fn sms_renew_at_ms(&self) -> u64 {
         compute_renew_at_ms(self.auth_expires_at_ms, self.renewal_lead_days)
+    }
+
+    /// REG_INFO's `renew_at_ms`: the next automatic renewal of any kind (see
+    /// [`reported_renew_at_ms`]).
+    fn renew_at_ms(&self) -> u64 {
+        reported_renew_at_ms(self.sms_renew_at_ms(), self.next_rereg_at_ms)
     }
 
     fn to_reg_info(&self) -> AppBody {
@@ -223,6 +230,24 @@ pub fn compute_renew_at_ms(auth_expires_at_ms: Option<u64>, lead_days: u64) -> u
     auth_expires_at_ms
         .map(|exp| exp.saturating_sub(lead_days.saturating_mul(MS_PER_DAY)))
         .unwrap_or(0)
+}
+
+/// What REG_INFO reports as `renew_at_ms` (0 = unknown): the earlier of the proactive SMS
+/// renewal and the next IDS re-registration.
+///
+/// Apple issues the phone-number auth certificate (`id-authenticate-phone-number`) for 10 years,
+/// so its SMS renewal date alone made the phone say "renews in 3643 days". What actually comes
+/// due is the IDS registration (the `com.apple.madrid` id certificate, valid for weeks, or
+/// Apple's `next-hbi`), which IdentityManager renews by itself through the relay, without an
+/// SMS, as long as the iPhone provider is online. The SMS renewal is still the date when it is sooner
+/// (an auth certificate close to expiry). Phones that read the field as "the next automatic
+/// renewal" (Messages 1.8.4 and older) then show a date that means something.
+pub fn reported_renew_at_ms(sms_renew_at_ms: u64, next_rereg_at_ms: Option<u64>) -> u64 {
+    match (sms_renew_at_ms, next_rereg_at_ms.unwrap_or(0)) {
+        (0, rereg) => rereg,
+        (sms, 0) => sms,
+        (sms, rereg) => sms.min(rereg),
+    }
 }
 
 fn apply_builtin_relay(relay_cfg: &mut RelayConfig, internal_relay: &(String, String)) {
@@ -952,11 +977,16 @@ async fn bridge_loop(
     identity: IDSNGMIdentity,
     mut users: Vec<IDSUser>,
 ) -> Result<()> {
-    let mut status = AppleStatusTracker::new(
-        &cfg.state_dir,
-        cfg.renewal.lead_days,
-        &relay.status(),
-    );
+    // Subscribe before the first snapshot and keep these for every session. A watch receiver
+    // treats the value current when it subscribes as seen, and a broadcast receiver only gets
+    // what is sent after it subscribes: subscribed after `IMClient::new` (as before), a relay
+    // provider connecting meanwhile, typically right after a restart, never reached REG_INFO
+    // (the phone said "Relay offline" until the provider reconnected), and a phone connecting
+    // meanwhile got no REG_INFO (Messages 1.7.3+ no longer asks for it).
+    let mut relay_status_rx = relay.subscribe_status();
+    let mut connect_rx = hub.subscribe_connects();
+    let initial_relay = relay_status_rx.borrow_and_update().clone();
+    let mut status = AppleStatusTracker::new(&cfg.state_dir, cfg.renewal.lead_days, &initial_relay);
     status.state = REG_STATE_OK;
     status.detail.clear();
     status.last_success_ms = Some(now_epoch_ms());
@@ -968,6 +998,10 @@ async fn bridge_loop(
             days_left, cfg.renewal.lead_days
         );
     }
+    if let Some(rereg_ms) = status.next_rereg_at_ms {
+        let hours_left = rereg_ms.saturating_sub(now_epoch_ms()) / 3_600_000;
+        info!("next IDS re-registration (through the relay) in ~{} hours", hours_left);
+    }
     status.save_and_broadcast(&hub).await;
     hub.media.set_aps(conn.clone());
 
@@ -975,13 +1009,14 @@ async fn bridge_loop(
         let outcome = bridge_session(
             cfg,
             &hub,
-            &relay,
             &mut incoming_rx,
             &conn,
             &relay_cfg,
             &identity,
             users,
             &mut status,
+            &mut relay_status_rx,
+            &mut connect_rx,
         )
         .await?;
 
@@ -1006,13 +1041,14 @@ async fn bridge_loop(
 async fn bridge_session(
     cfg: &Config,
     hub: &Arc<Hub>,
-    relay: &Arc<RelayHub>,
     incoming_rx: &mut mpsc::Receiver<IncomingClientMsg>,
     conn: &APSConnection,
     relay_cfg: &RelayConfig,
     identity: &IDSNGMIdentity,
     users: Vec<IDSUser>,
     status: &mut AppleStatusTracker,
+    relay_status_rx: &mut watch::Receiver<RelayStatus>,
+    connect_rx: &mut broadcast::Receiver<String>,
 ) -> Result<SessionOutcome> {
     let id_path = cfg.apple_dir.join("id.plist");
 
@@ -1222,10 +1258,15 @@ async fn bridge_session(
         }
     });
 
-    // Subscriptions for status, renewal, provider health, and phone connects.
+    // Registration state (relay status and phone connects were subscribed by bridge_loop). A
+    // failure already reported before this subscription is handled on the first pass.
     let mut id_state_rx = im_client.identity.resource_state.subscribe();
-    let mut relay_status_rx = relay.subscribe_status();
-    let mut connect_rx = hub.subscribe_connects();
+    if matches!(
+        *id_state_rx.borrow(),
+        ResourceState::Failed(_) | ResourceState::Closed
+    ) {
+        id_state_rx.mark_changed();
+    }
     let mut renewal_tick = tokio::time::interval(RENEWAL_CHECK_INTERVAL);
 
     let mut renewal = RenewalController::new();
@@ -1323,8 +1364,21 @@ async fn bridge_session(
             }
 
             joined = connect_rx.recv() => {
-                if let Ok(cid) = joined {
-                    status.send_to(hub, &cid).await;
+                let cid = match joined {
+                    Ok(cid) => {
+                        status.send_to(hub, &cid).await;
+                        Some(cid)
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Connects were missed (a burst while IMClient was starting): give every
+                        // connected phone the current REG_INFO instead.
+                        warn!("missed {} phone connect notices; sending REG_INFO to all", n);
+                        status.save_and_broadcast(hub).await;
+                        hub.connected_client_ids().into_iter().next()
+                    }
+                    Err(broadcast::error::RecvError::Closed) => None,
+                };
+                if let Some(cid) = cid {
                     if matches!(renewal.phase, RenewalPhase::WaitingForPhone) {
                         info!("client '{}' connected; starting pending phone renewal", cid);
                         begin_sim_info_request(hub, status, &mut renewal, cid).await;
@@ -1641,7 +1695,7 @@ async fn maybe_trigger_proactive_renewal(
     if !matches!(renewal.phase, RenewalPhase::Idle) {
         return;
     }
-    let renew_at = status.renew_at_ms();
+    let renew_at = status.sms_renew_at_ms();
     if renew_at == 0 {
         return;
     }
@@ -2447,5 +2501,74 @@ mod tests {
             compute_renew_at_ms(Some(exp_ms), 7),
             1_800_000_000_000 - 7 * MS_PER_DAY
         );
+    }
+
+    #[test]
+    fn reported_renewal_is_the_next_automatic_one() {
+        assert_eq!(reported_renew_at_ms(0, None), 0);
+        assert_eq!(reported_renew_at_ms(0, Some(0)), 0);
+        assert_eq!(reported_renew_at_ms(500, None), 500);
+        assert_eq!(reported_renew_at_ms(0, Some(700)), 700);
+        assert_eq!(reported_renew_at_ms(500, Some(700)), 500);
+        assert_eq!(reported_renew_at_ms(900, Some(700)), 700);
+    }
+
+    /// A 10-year phone auth certificate (what Apple issues) and an IDS registration due in 30
+    /// days: REG_INFO reports the re-registration, not "renews in 3643 days", while the SMS
+    /// renewal itself still waits for the certificate.
+    #[test]
+    fn reg_info_with_ten_year_auth_cert() {
+        let now = now_epoch_ms();
+        let relay = RelayStatus {
+            provider_connected: true,
+            provider_code: None,
+            last_answered_ms: None,
+        };
+        let dir = std::env::temp_dir().join(format!("imsg-apple-test-{}", Uuid::new_v4()));
+        let mut status = AppleStatusTracker::new(&dir, 7, &relay);
+        status.state = REG_STATE_OK;
+        status.auth_expires_at_ms = Some(now + 3650 * MS_PER_DAY);
+        status.next_rereg_at_ms = Some(now + 30 * MS_PER_DAY);
+        assert_eq!(status.sms_renew_at_ms(), now + 3643 * MS_PER_DAY);
+        match status.to_reg_info() {
+            AppBody::RegInfo {
+                auth_expires_at_ms,
+                next_rereg_at_ms,
+                renew_at_ms,
+                provider_connected,
+                ..
+            } => {
+                assert_eq!(auth_expires_at_ms, now + 3650 * MS_PER_DAY);
+                assert_eq!(next_rereg_at_ms, now + 30 * MS_PER_DAY);
+                assert_eq!(renew_at_ms, now + 30 * MS_PER_DAY);
+                assert!(provider_connected);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        // A certificate about to expire: the SMS renewal is the next one.
+        status.auth_expires_at_ms = Some(now + 10 * MS_PER_DAY);
+        assert_eq!(status.renew_at_ms(), now + 3 * MS_PER_DAY);
+    }
+
+    /// Subscribing before the snapshot (bridge_loop) sees a relay provider that connects while
+    /// IMClient starts; subscribing after it (as before) did not.
+    #[tokio::test]
+    async fn relay_status_change_during_startup_is_seen() {
+        let initial = RelayStatus {
+            provider_connected: false,
+            provider_code: None,
+            last_answered_ms: None,
+        };
+        let (tx, _) = watch::channel(initial);
+        let mut early = tx.subscribe();
+        let snapshot = early.borrow_and_update().clone();
+        tx.send_modify(|s| s.provider_connected = true); // provider connects during IMClient::new
+        let mut late = tx.subscribe();
+        assert!(!snapshot.provider_connected);
+        assert!(early.has_changed().unwrap());
+        assert!(!late.has_changed().unwrap(), "a late subscriber misses the change");
+        early.changed().await.unwrap();
+        assert!(early.borrow().provider_connected);
+        let _ = late.borrow_and_update();
     }
 }

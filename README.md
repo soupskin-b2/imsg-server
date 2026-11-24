@@ -138,6 +138,11 @@ early (IDS error 6005). `imsg-server` handles both automatically:
   built-in relay. If the iPhone provider is offline, `imsg-server` retries automatically and
   triggers an immediate re-registration as soon as the iPhone reconnects.
 
+Apple currently issues the phone auth certificate for 10 years, so in practice the SMS renewal runs
+after a 6005, while the IDS registration is renewed through the relay every few weeks. The phone's
+Renewal line (REG_INFO `renew_at_ms`) shows whichever of the two comes first, and "Relay offline"
+when the iPhone provider is not connected (the next re-registration then needs it back).
+
 **SMS cost notice:** each phone-number registration and renewal sends an outgoing SMS from the flip
 phone to Apple's carrier registration gateway (often an international number, depending on your
 carrier). Some mobile plans charge per international SMS.
