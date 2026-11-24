@@ -183,6 +183,11 @@ retention_days = 30          # how long "Save attachment" can still fetch the fu
 # ffmpeg = "/usr/bin/ffmpeg" # ffprobe is looked up next to it
 ```
 
+Messages wait in `state/` for a phone that's offline, up to 5000 per phone (or 64 MB); beyond that
+the oldest are dropped. A paired phone that hasn't connected for 90 days is taken to be gone (for
+example one that was paired again and got a new id) and gets nothing queued; the log says which,
+and you can remove its `[[clients]]` entry from `config.toml`.
+
 Losing `state/` (a new server, a restore from an old backup) doesn't confuse the phone: each side's
 message numbering carries a random epoch, so when either side's state is new the other starts
 over instead of dropping its messages as already seen. Messages that were still queued in the lost

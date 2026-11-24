@@ -59,6 +59,27 @@ struct HubInner {
     next_gen: u64,
     slots: HashMap<String, ClientSlot>,
     last_wakeup: HashMap<String, Instant>,
+    /// Stale clients already warned about (once per run).
+    stale_warned: std::collections::HashSet<String>,
+}
+
+/// A client not connected for this long gets no new messages queued (see `deliver_all`).
+const STALE_CLIENT_DAYS: u64 = 90;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// "2026-08-01 (113 days ago)"-style, for logs.
+fn fmt_ago(ms: u64) -> String {
+    if ms == 0 {
+        return "never".to_string();
+    }
+    let days = now_ms().saturating_sub(ms) / (24 * 60 * 60 * 1000);
+    format!("{} days ago", days)
 }
 
 pub struct Hub {
@@ -86,7 +107,11 @@ impl Hub {
         let mut slots = HashMap::new();
         for c in &cfg.clients {
             let hash = c.token_hash_bytes()?;
-            let state = ClientState::load_or_default(&cfg.state_dir, &c.id)?;
+            let mut state = ClientState::load_or_default(&cfg.state_dir, &c.id)?;
+            if state.last_seen_ms == 0 {
+                // From before last_seen was kept: count from now.
+                state.last_seen_ms = now_ms();
+            }
             auth_entries.push((c.id.clone(), hash));
             slots.insert(
                 c.id.clone(),
@@ -114,6 +139,7 @@ impl Hub {
                 next_gen: 1,
                 slots,
                 last_wakeup: HashMap::new(),
+                stale_warned: std::collections::HashSet::new(),
             }),
         })
     }
@@ -192,7 +218,16 @@ impl Hub {
                 .slots
                 .get_mut(client_id)
                 .ok_or_else(|| anyhow!("unknown client '{}'", client_id))?;
-            let seq = slot.state.enqueue(&body);
+            let (seq, dropped) = slot.state.enqueue_bounded(&body);
+            if dropped > 0 {
+                warn!(
+                    "client '{}': {} unread messages queued, dropped the {} oldest (it hasn't connected since {})",
+                    client_id,
+                    slot.state.outbox.len(),
+                    dropped,
+                    fmt_ago(slot.state.last_seen_ms)
+                );
+            }
             slot.state.save(&self.state_dir, client_id)?;
             let tx = slot.active.as_ref().map(|a| a.cmd_tx.clone());
             (seq, tx)
@@ -219,10 +254,33 @@ impl Hub {
         Ok(seq)
     }
 
-    /// Delivers a body to every configured client.
+    /// Delivers a body to every configured client that isn't stale: one that hasn't connected
+    /// for STALE_CLIENT_DAYS is most likely a phone that was paired again under a new id (or is
+    /// gone), and queueing every message for it only grows its state file.
     pub async fn deliver_all(&self, body: Vec<u8>) -> Result<()> {
         let ids = self.client_ids();
+        let now = now_ms();
+        let stale_ms = STALE_CLIENT_DAYS * 24 * 60 * 60 * 1000;
         for id in ids {
+            let last_seen = {
+                let inner = self.inner.lock().expect("hub mutex poisoned");
+                inner.slots.get(&id).map(|s| (s.state.last_seen_ms, s.active.is_some()))
+            };
+            if let Some((seen, active)) = last_seen {
+                if !active && seen != 0 && now.saturating_sub(seen) > stale_ms {
+                    let mut inner = self.inner.lock().expect("hub mutex poisoned");
+                    if inner.stale_warned.insert(id.clone()) {
+                        warn!(
+                            "client '{}' hasn't connected for over {} days (since {}); not queueing messages for it. \
+                             Remove its [[clients]] entry from config.toml if it's gone.",
+                            id,
+                            STALE_CLIENT_DAYS,
+                            fmt_ago(seen)
+                        );
+                    }
+                    continue;
+                }
+            }
             if let Err(e) = self.deliver(&id, body.clone()).await {
                 warn!("failed to deliver message to client '{}': {:#}", id, e);
             }
@@ -251,7 +309,10 @@ impl Hub {
             .replace(ActiveConn { generation, cmd_tx })
             .map(|old| old.cmd_tx);
 
-        let mut dirty = false;
+        // Persisted below (rarely: only once an hour is enough to know it's alive).
+        let now = now_ms();
+        let mut dirty = now.saturating_sub(slot.state.last_seen_ms) > 60 * 60 * 1000;
+        slot.state.last_seen_ms = now;
         let mut client_last_rx_seq = client_last_rx_seq;
         let mut epoch = None;
         if let Some((client_epoch, seen_epoch)) = epochs {
@@ -351,6 +412,12 @@ impl Hub {
         if let Some(slot) = inner.slots.get_mut(client_id) {
             if slot.active.as_ref().map(|a| a.generation) == Some(generation) {
                 slot.active = None;
+                // Seen until now (a phone can stay on one connection for days); kept on disk so
+                // a restart doesn't think it's been away since it connected.
+                slot.state.last_seen_ms = now_ms();
+                if let Err(e) = slot.state.save(&self.state_dir, client_id) {
+                    warn!("client '{}': failed to save state on disconnect: {:#}", client_id, e);
+                }
             }
         }
     }

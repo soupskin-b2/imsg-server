@@ -25,7 +25,17 @@ pub struct ClientState {
     /// The client's epoch as of its last HELLO (0: never sent one).
     #[serde(default)]
     pub client_epoch: u64,
+    /// When the client last opened a main connection (ms since the epoch; 0: unknown).
+    #[serde(default)]
+    pub last_seen_ms: u64,
 }
+
+/// Most messages kept for a client that isn't taking them; beyond this the oldest are dropped.
+/// A phone that's away (or a client left behind by pairing again) must not grow the state file
+/// without bound: it's rewritten and synced on every message.
+pub const MAX_OUTBOX: usize = 5000;
+/// Most bytes (base64) kept in one outbox, for the same reason.
+pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
 
 impl ClientState {
     pub fn file_path(state_dir: &Path, client_id: &str) -> PathBuf {
@@ -75,11 +85,31 @@ impl ClientState {
         Ok(())
     }
 
-    pub fn enqueue(&mut self, body: &[u8]) -> u64 {
+    /// Queues `body` as the next seq. Returns it and how many old messages were dropped to stay
+    /// within MAX_OUTBOX / MAX_OUTBOX_BYTES.
+    pub fn enqueue_bounded(&mut self, body: &[u8]) -> (u64, usize) {
         self.tx_seq += 1;
         let seq = self.tx_seq;
         self.outbox.insert(seq, BASE64.encode(body));
-        seq
+        let mut dropped = 0;
+        while self.outbox.len() > MAX_OUTBOX {
+            self.outbox.pop_first();
+            dropped += 1;
+        }
+        if self.outbox.len() > 1 {
+            let mut bytes: usize = self.outbox.values().map(String::len).sum();
+            while bytes > MAX_OUTBOX_BYTES && self.outbox.len() > 1 {
+                if let Some((_, v)) = self.outbox.pop_first() {
+                    bytes -= v.len();
+                    dropped += 1;
+                }
+            }
+        }
+        (seq, dropped)
+    }
+
+    pub fn enqueue(&mut self, body: &[u8]) -> u64 {
+        self.enqueue_bounded(body).0
     }
 
     pub fn ack_up_to(&mut self, seq: u64) -> usize {
@@ -118,6 +148,27 @@ impl ClientState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbox_is_bounded() {
+        let mut st = ClientState::default();
+        let mut dropped = 0;
+        for _ in 0..MAX_OUTBOX + 10 {
+            dropped += st.enqueue_bounded(b"x").1;
+        }
+        assert_eq!(dropped, 10);
+        assert_eq!(st.outbox.len(), MAX_OUTBOX);
+        assert_eq!(*st.outbox.keys().next().unwrap(), 11);
+        assert_eq!(st.tx_seq, (MAX_OUTBOX + 10) as u64);
+
+        let mut big = ClientState::default();
+        let chunk = vec![0u8; 3 * 1024 * 1024]; // 4 MiB as base64
+        for _ in 0..20 {
+            big.enqueue_bounded(&chunk);
+        }
+        let bytes: usize = big.outbox.values().map(String::len).sum();
+        assert!(bytes <= MAX_OUTBOX_BYTES && big.outbox.len() == 16, "{} msgs", big.outbox.len());
+    }
 
     #[test]
     fn atomic_save_and_outbox_ops() {
