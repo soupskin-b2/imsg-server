@@ -23,8 +23,8 @@ What crosses the bridge:
   phone sends (JPEG, 3GP, AMR) is converted to what iPhones show inline. Other files arrive as
   `[File: name, size]`.
 - **Tapbacks**, shown as badges on the message, both ways (the phone sends the six standard ones).
-- **Edits** (`... (edited)`), **unsends** (`This message was unsent`), and group **renames, member
-  changes and photo changes** as notices in the conversation.
+- **Edits** (`... (edited)`, earlier versions kept), **unsends** (the message stays, marked
+  `Unsent`), and group **renames, member changes and photo changes** as notices in the conversation.
 - iMessage apps, Apple Cash, Check In and similar show a readable label such as `[Apple Cash]`.
 
 ## What you need
@@ -183,9 +183,15 @@ retention_days = 30          # how long "Save attachment" can still fetch the fu
 # ffmpeg = "/usr/bin/ffmpeg" # ffprobe is looked up next to it
 ```
 
+Losing `state/` (a new server, a restore from an old backup) doesn't confuse the phone: each side's
+message numbering carries a random epoch, so when either side's state is new the other starts
+over instead of dropping its messages as already seen. Messages that were still queued in the lost
+state are gone, nothing else.
+
 The server and the phone must run the same protocol version: protocol 2 (this release) needs
-Messages Improved 1.5.0 or later. Update both together; messages still queued for an older phone
-are not readable by the new one.
+Messages Improved 1.5.0 or later, and Messages Improved 1.6.2 or later needs this release (its
+HELLO carries the epochs; older protocol 2 servers refuse it). Update the server first, then the
+phone; messages still queued for a protocol 1 phone are not readable by the new one.
 
 ## Testing without Apple
 

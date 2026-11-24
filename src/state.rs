@@ -18,6 +18,13 @@ pub struct ClientState {
     /// Unacknowledged outgoing message bodies (base64-encoded), keyed by seq.
     #[serde(default)]
     pub outbox: BTreeMap<u64, String>,
+    /// Random id of this state's seq numbering, sent in WELCOME; 0 until first needed. A wiped
+    /// state gets a new one, which tells the client our seqs start at 1 again.
+    #[serde(default)]
+    pub epoch: u64,
+    /// The client's epoch as of its last HELLO (0: never sent one).
+    #[serde(default)]
+    pub client_epoch: u64,
 }
 
 impl ClientState {
@@ -94,6 +101,17 @@ impl ClientState {
 
     pub fn is_outbox_empty(&self) -> bool {
         self.outbox.is_empty()
+    }
+
+    /// Our epoch, made (random, nonzero) the first time; true in `.1` if it was just made.
+    pub fn ensure_epoch(&mut self) -> (u64, bool) {
+        if self.epoch != 0 {
+            return (self.epoch, false);
+        }
+        while self.epoch == 0 {
+            self.epoch = rand::random();
+        }
+        (self.epoch, true)
     }
 }
 

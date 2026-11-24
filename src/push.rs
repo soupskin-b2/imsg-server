@@ -76,6 +76,8 @@ struct MainRegistration {
     generation: u64,
     server_last_rx_seq: u64,
     pending: Vec<(u64, Vec<u8>)>,
+    /// Our epoch for the WELCOME, if the client speaks epochs.
+    epoch: Option<u64>,
 }
 
 impl Hub {
@@ -232,6 +234,7 @@ impl Hub {
         &self,
         client_id: &str,
         client_last_rx_seq: u64,
+        epochs: Option<(u64, u64)>,
         cmd_tx: mpsc::Sender<ConnCmd>,
     ) -> Result<(MainRegistration, Option<mpsc::Sender<ConnCmd>>)> {
         let mut inner = self.inner.lock().expect("hub mutex poisoned");
@@ -248,8 +251,42 @@ impl Hub {
             .replace(ActiveConn { generation, cmd_tx })
             .map(|old| old.cmd_tx);
 
+        let mut dirty = false;
+        let mut client_last_rx_seq = client_last_rx_seq;
+        let mut epoch = None;
+        if let Some((client_epoch, seen_epoch)) = epochs {
+            let (ours, made) = slot.state.ensure_epoch();
+            dirty |= made;
+            epoch = Some(ours);
+            if client_epoch != 0 && client_epoch != slot.state.client_epoch {
+                // A new client state (app data cleared, state file lost) numbers its messages
+                // from 1 again: without this they'd all be dropped as duplicates of old seqs.
+                if slot.state.client_epoch != 0 && slot.state.last_rx_seq != 0 {
+                    warn!(
+                        "client '{}': its state is new (epoch {:016x}, was {:016x}); taking its messages from seq 1 (was {})",
+                        client_id, client_epoch, slot.state.client_epoch, slot.state.last_rx_seq
+                    );
+                    slot.state.last_rx_seq = 0;
+                }
+                slot.state.client_epoch = client_epoch;
+                dirty = true;
+            }
+            if seen_epoch != 0 && seen_epoch != ours && client_last_rx_seq != 0 {
+                // Its last_rx_seq counts another (older) state of ours: it ACKs nothing here.
+                warn!(
+                    "client '{}': last_rx_seq {} is from another server state (epoch {:016x}, ours {:016x}); resending everything unACKed",
+                    client_id, client_last_rx_seq, seen_epoch, ours
+                );
+                client_last_rx_seq = 0;
+            }
+        }
+
         // Implicit ACK of everything up to client's last_rx_seq.
         if slot.state.ack_up_to(client_last_rx_seq) > 0 {
+            dirty = true;
+        }
+        // Persisted before the WELCOME, so the epoch it carries is the one we keep.
+        if dirty {
             slot.state.save(&self.state_dir, client_id)?;
         }
 
@@ -261,6 +298,7 @@ impl Hub {
                 generation,
                 server_last_rx_seq,
                 pending,
+                epoch,
             },
             old_tx,
         ))
@@ -595,6 +633,7 @@ where
         token,
         last_rx_seq,
         interval_s,
+        epochs,
     }) = first
     else {
         let _ = write_frame(&mut stream, &Frame::Bye { reason: BYE_PROTOCOL_ERROR }).await;
@@ -652,7 +691,7 @@ where
                 "client '{}' main connected from {} (last_rx_seq={}, interval_s={})",
                 client_id, peer, last_rx_seq, interval_s
             );
-            handle_main(stream, &client_id, peer, last_rx_seq, interval_s, hub, incoming_tx).await
+            handle_main(stream, &client_id, peer, last_rx_seq, epochs, interval_s, hub, incoming_tx).await
         }
         other => {
             warn!("client '{}' sent invalid role {}", client_id, other);
@@ -666,7 +705,7 @@ async fn handle_probe<S>(mut stream: S, client_id: &str, peer: SocketAddr) -> Re
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    write_frame(&mut stream, &Frame::Welcome { last_rx_seq: 0 }).await?;
+    write_frame(&mut stream, &Frame::Welcome { last_rx_seq: 0, epoch: None }).await?;
 
     let idle_limit = Duration::from_secs(PROBE_SERVER_IDLE_S);
     loop {
@@ -733,7 +772,7 @@ where
 {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-    write_frame(&mut stream, &Frame::Welcome { last_rx_seq: 0 }).await?;
+    write_frame(&mut stream, &Frame::Welcome { last_rx_seq: 0, epoch: None }).await?;
     let mut upload: Option<UploadInProgress> = None;
     let result: Result<()> = async {
         loop {
@@ -863,6 +902,7 @@ async fn handle_main<S>(
     client_id: &str,
     peer: SocketAddr,
     client_last_rx_seq: u64,
+    epochs: Option<(u64, u64)>,
     initial_interval_s: u16,
     hub: Arc<Hub>,
     incoming_tx: mpsc::Sender<IncomingClientMsg>,
@@ -871,7 +911,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ConnCmd>(256);
-    let (reg, old_tx) = hub.register_main(client_id, client_last_rx_seq, cmd_tx)?;
+    let (reg, old_tx) = hub.register_main(client_id, client_last_rx_seq, epochs, cmd_tx)?;
 
     if let Some(old) = old_tx {
         info!(
@@ -927,6 +967,7 @@ where
         out_tx
             .send(Frame::Welcome {
                 last_rx_seq: reg.server_last_rx_seq,
+                epoch: reg.epoch,
             })
             .await
             .is_ok()

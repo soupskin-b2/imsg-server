@@ -55,9 +55,15 @@ pub enum Frame {
         token: Vec<u8>,
         last_rx_seq: u64,
         interval_s: u16,
+        /// Main connections: (the client's epoch, the server epoch its `last_rx_seq` counts in, 0
+        /// if none yet). Each side's state has a random epoch; a new one means that side's state
+        /// is new and its seqs start at 1 again (see `Hub::register_main`). Optional on the wire.
+        epochs: Option<(u64, u64)>,
     },
     Welcome {
         last_rx_seq: u64,
+        /// The server's epoch for this client, sent only when the HELLO carried epochs.
+        epoch: Option<u64>,
     },
     Msg {
         seq: u64,
@@ -194,6 +200,7 @@ impl Frame {
                 token,
                 last_rx_seq,
                 interval_s,
+                epochs,
             } => {
                 if token.len() > u8::MAX as usize {
                     bail!("HELLO token length {} exceeds 255", token.len());
@@ -204,9 +211,16 @@ impl Frame {
                 payload.extend_from_slice(token);
                 payload.extend_from_slice(&last_rx_seq.to_be_bytes());
                 payload.extend_from_slice(&interval_s.to_be_bytes());
+                if let Some((own, peer)) = epochs {
+                    payload.extend_from_slice(&own.to_be_bytes());
+                    payload.extend_from_slice(&peer.to_be_bytes());
+                }
             }
-            Frame::Welcome { last_rx_seq } => {
+            Frame::Welcome { last_rx_seq, epoch } => {
                 payload.extend_from_slice(&last_rx_seq.to_be_bytes());
+                if let Some(e) = epoch {
+                    payload.extend_from_slice(&e.to_be_bytes());
+                }
             }
             Frame::Msg { seq, body } => {
                 if body.len() > MAX_MSG_BODY_LEN {
@@ -299,15 +313,26 @@ impl Frame {
                 let token = r.take(token_len)?.to_vec();
                 let last_rx_seq = r.u64()?;
                 let interval_s = u16::from_be_bytes(r.take(2)?.try_into()?);
+                // Anything but exactly the two epochs is left over and refused below.
+                let epochs = if payload.len() - r.pos == 16 {
+                    Some((r.u64()?, r.u64()?))
+                } else {
+                    None
+                };
                 Frame::Hello {
                     version,
                     role,
                     token,
                     last_rx_seq,
                     interval_s,
+                    epochs,
                 }
             }
-            FRAME_WELCOME => Frame::Welcome { last_rx_seq: r.u64()? },
+            FRAME_WELCOME => {
+                let last_rx_seq = r.u64()?;
+                let epoch = if payload.len() - r.pos == 8 { Some(r.u64()?) } else { None };
+                Frame::Welcome { last_rx_seq, epoch }
+            }
             FRAME_MSG => Frame::Msg {
                 seq: r.u64()?,
                 body: r.rest(),
@@ -422,8 +447,24 @@ mod tests {
                 token: b"deadbeef01234567".to_vec(),
                 last_rx_seq: 42,
                 interval_s: 300,
+                epochs: None,
             },
-            Frame::Welcome { last_rx_seq: 99 },
+            Frame::Hello {
+                version: PROTOCOL_VERSION,
+                role: ROLE_MAIN,
+                token: b"deadbeef01234567".to_vec(),
+                last_rx_seq: 42,
+                interval_s: 300,
+                epochs: Some((0x0123_4567_89ab_cdef, u64::MAX)),
+            },
+            Frame::Welcome {
+                last_rx_seq: 99,
+                epoch: None,
+            },
+            Frame::Welcome {
+                last_rx_seq: 99,
+                epoch: Some(0xfeed_f00d),
+            },
             Frame::Msg {
                 seq: 7,
                 body: vec![1, 2, 3, 4, 5],
@@ -491,6 +532,7 @@ mod tests {
             token: vec![b'a'; 64],
             last_rx_seq: 0,
             interval_s: 60,
+            epochs: Some((1, 2)),
         }
         .encode()
         .unwrap();
