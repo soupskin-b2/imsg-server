@@ -19,6 +19,8 @@ pub const BODY_REACTION: u8 = 0x10;
 pub const BODY_EDIT: u8 = 0x11;
 pub const BODY_UNSEND: u8 = 0x12;
 pub const BODY_GROUP_EVENT: u8 = 0x13;
+pub const BODY_SEND_EDIT: u8 = 0x14;
+pub const BODY_SEND_UNSEND: u8 = 0x15;
 
 /// SETUP_STATUS states (server -> phone).
 pub const SETUP_READY: u8 = 0;
@@ -141,6 +143,27 @@ pub enum AppBody {
         enable: bool,
         /// The reacted-to message's text, for Apple's notification and non-Apple fallbacks.
         target_text: String,
+    },
+    /// Phone -> server: replace the text of the phone's own message `target_id` (answered by
+    /// SEND_RESULT; Apple allows it for 15 minutes, five times).
+    SendEdit {
+        client_msg_id: String,
+        participants: Vec<String>,
+        sender_guid: Option<String>,
+        target_id: String,
+        /// Index of the text part (the number of attachments before it; 0 for a plain text).
+        part: u8,
+        text: String,
+    },
+    /// Phone -> server: take back the phone's own message `target_id` (answered by SEND_RESULT;
+    /// Apple allows it for 2 minutes).
+    SendUnsend {
+        client_msg_id: String,
+        participants: Vec<String>,
+        sender_guid: Option<String>,
+        target_id: String,
+        /// How many parts the message has (attachments plus text): each is taken back.
+        parts: u8,
     },
     /// Server -> phone: where phone-number setup stands.
     SetupStatus {
@@ -466,6 +489,36 @@ impl AppBody {
                 write_bool(&mut buf, *enable);
                 write_text(&mut buf, target_text)?;
             }
+            AppBody::SendEdit {
+                client_msg_id,
+                participants,
+                sender_guid,
+                target_id,
+                part,
+                text,
+            } => {
+                buf.push(BODY_SEND_EDIT);
+                write_str(&mut buf, client_msg_id)?;
+                write_str_list(&mut buf, participants)?;
+                write_opt_str(&mut buf, sender_guid)?;
+                write_str(&mut buf, target_id)?;
+                buf.push(*part);
+                write_text(&mut buf, text)?;
+            }
+            AppBody::SendUnsend {
+                client_msg_id,
+                participants,
+                sender_guid,
+                target_id,
+                parts,
+            } => {
+                buf.push(BODY_SEND_UNSEND);
+                write_str(&mut buf, client_msg_id)?;
+                write_str_list(&mut buf, participants)?;
+                write_opt_str(&mut buf, sender_guid)?;
+                write_str(&mut buf, target_id)?;
+                buf.push(*parts);
+            }
             AppBody::SetupStatus { state, detail } => {
                 buf.push(BODY_SETUP_STATUS);
                 buf.push(*state);
@@ -667,6 +720,21 @@ impl AppBody {
                 enable: c.read_bool()?,
                 target_text: c.read_text()?,
             },
+            BODY_SEND_EDIT => AppBody::SendEdit {
+                client_msg_id: c.read_str()?,
+                participants: c.read_str_list()?,
+                sender_guid: c.read_opt_str()?,
+                target_id: c.read_str()?,
+                part: c.read_u8()?,
+                text: c.read_text()?,
+            },
+            BODY_SEND_UNSEND => AppBody::SendUnsend {
+                client_msg_id: c.read_str()?,
+                participants: c.read_str_list()?,
+                sender_guid: c.read_opt_str()?,
+                target_id: c.read_str()?,
+                parts: c.read_u8()?,
+            },
             BODY_SETUP_STATUS => AppBody::SetupStatus {
                 state: c.read_u8()?,
                 detail: c.read_str()?,
@@ -835,6 +903,21 @@ mod tests {
                 emoji: None,
                 enable: true,
                 target_text: "Hey there".into(),
+            },
+            AppBody::SendEdit {
+                client_msg_id: "c-5".into(),
+                participants: vec!["tel:+15551234567".into()],
+                sender_guid: Some("guid-1".into()),
+                target_id: "apple-456".into(),
+                part: 2,
+                text: "Hey there!".into(),
+            },
+            AppBody::SendUnsend {
+                client_msg_id: "c-6".into(),
+                participants: vec!["tel:+15551234567".into(), "mailto:alice@icloud.com".into()],
+                sender_guid: None,
+                target_id: "apple-456".into(),
+                parts: 3,
             },
             AppBody::RegInfoReq,
             AppBody::RegInfo {

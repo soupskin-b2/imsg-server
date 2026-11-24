@@ -391,7 +391,10 @@ async fn run_echo_backend(
                         );
                         echo_deliver(&hub, &msg.client_id, info).await;
                     }
-                    Ok(AppBody::SendMessage { client_msg_id, .. } | AppBody::SendReaction { client_msg_id, .. })
+                    Ok(AppBody::SendMessage { client_msg_id, .. }
+                    | AppBody::SendReaction { client_msg_id, .. }
+                    | AppBody::SendEdit { client_msg_id, .. }
+                    | AppBody::SendUnsend { client_msg_id, .. })
                         if handle.is_empty() =>
                     {
                         let reply = AppBody::SendResult {
@@ -476,6 +479,32 @@ async fn run_echo_backend(
                             };
                             echo_deliver(&hub, &msg.client_id, back).await;
                         }
+                    }
+                    // Edits and unsends of the phone's own messages: accepted (an edit to "/fail"
+                    // is refused, to test the phone's error path). The other side sees nothing.
+                    Ok(AppBody::SendEdit { client_msg_id, target_id, part, text, .. }) => {
+                        info!(
+                            "[echo] client '{}' SEND_EDIT on={} part={} text={:?}",
+                            msg.client_id, target_id, part, text
+                        );
+                        let fail = text.trim() == "/fail";
+                        let res_body = AppBody::SendResult {
+                            client_msg_id,
+                            ok: !fail,
+                            apple_msg_id: (!fail).then(|| format!("echo-e-{}", Uuid::new_v4()).to_uppercase()),
+                            error: fail.then(|| "Echo refused the edit (/fail)".to_string()),
+                        };
+                        echo_deliver(&hub, &msg.client_id, res_body).await;
+                    }
+                    Ok(AppBody::SendUnsend { client_msg_id, target_id, parts, .. }) => {
+                        info!("[echo] client '{}' SEND_UNSEND on={} parts={}", msg.client_id, target_id, parts);
+                        let res_body = AppBody::SendResult {
+                            client_msg_id,
+                            ok: true,
+                            apple_msg_id: Some(format!("echo-u-{}", Uuid::new_v4()).to_uppercase()),
+                            error: None,
+                        };
+                        echo_deliver(&hub, &msg.client_id, res_body).await;
                     }
                     Ok(AppBody::GetHandles) => {
                         info!("[echo] client '{}' seq={} GET_HANDLES", msg.client_id, msg.seq);

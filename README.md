@@ -25,6 +25,8 @@ What crosses the bridge:
 - **Tapbacks**, shown as badges on the message, both ways (the phone sends the six standard ones).
 - **Edits** (`... (edited)`, earlier versions kept), **unsends** (the message stays, marked
   `Unsent`), and group **renames, member changes and photo changes** as notices in the conversation.
+- **Editing and unsending your own messages** from the phone, within Apple's limits (edit within
+  15 minutes, up to 5 times; unsend within 2 minutes). Needs Messages Improved 1.8.0 or later.
 - iMessage apps, Apple Cash, Check In and similar show a readable label such as `[Apple Cash]`.
 
 ## What you need
@@ -213,6 +215,9 @@ the other side act instead:
 | `/edit text`, `/unsend` | edits or unsends its last echoed message |
 | `/photo`, `/video`, `/voice`, `/sticker` | sends a 12 MP photo, a 1080p MOV, a CAF voice message or a PNG sticker (needs ffmpeg) |
 | `/photos` | sends one message with four attachments (photo, sticker, photo, video) |
+
+Edits and unsends of your own messages are accepted (nothing is sent back); an edit to `/fail` is
+refused, to try the phone's error message.
 | `/group text` | starts a group with you and a third person; the next group commands act on it |
 | `/gsay text` | says something in that group |
 | `/rename name`, `/icon` | renames the group, changes its photo |

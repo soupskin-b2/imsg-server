@@ -20,7 +20,8 @@ use plist::Data;
 use rand::RngCore;
 use rustpush::{
     authenticate_phone, get_gateways_for_mccmnc, register, APSConnection, APSConnectionResource,
-    APSState, Attachment, AuthPhone, BalloonLayout, ConversationData, ExtensionApp, IDSNGMIdentity,
+    APSState, Attachment, AuthPhone, BalloonLayout, ConversationData, EditMessage, ExtensionApp,
+    IDSNGMIdentity, UnsendMessage,
     IDSUser, IMClient, IndexedMessagePart, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, PushError, Reaction, ReactMessage,
     ReactMessageType, RelayConfig, ResourceFailure, ResourceState, MADRID_SERVICE,
@@ -578,7 +579,9 @@ pub async fn run_apple(
                         }
                     }
                     AppBody::SendMessage { client_msg_id, .. }
-                    | AppBody::SendReaction { client_msg_id, .. } => {
+                    | AppBody::SendReaction { client_msg_id, .. }
+                    | AppBody::SendEdit { client_msg_id, .. }
+                    | AppBody::SendUnsend { client_msg_id, .. } => {
                         let reply = AppBody::SendResult {
                             client_msg_id,
                             ok: false,
@@ -1453,6 +1456,56 @@ async fn bridge_session(
                             deliver(&hub, &client_id, send_result(client_msg_id, result)).await;
                         });
                     }
+                    AppBody::SendEdit {
+                        client_msg_id,
+                        participants,
+                        sender_guid,
+                        target_id,
+                        part,
+                        text,
+                    } => {
+                        let im_client = Arc::clone(&im_client);
+                        let hub = Arc::clone(hub);
+                        let preferred = preferred_handle.clone();
+                        let client_id = msg.client_id;
+                        tokio::spawn(async move {
+                            let result = send_edit(
+                                &im_client,
+                                preferred.as_deref(),
+                                &participants,
+                                sender_guid,
+                                target_id,
+                                part,
+                                text,
+                            )
+                            .await;
+                            deliver(&hub, &client_id, send_result(client_msg_id, result)).await;
+                        });
+                    }
+                    AppBody::SendUnsend {
+                        client_msg_id,
+                        participants,
+                        sender_guid,
+                        target_id,
+                        parts,
+                    } => {
+                        let im_client = Arc::clone(&im_client);
+                        let hub = Arc::clone(hub);
+                        let preferred = preferred_handle.clone();
+                        let client_id = msg.client_id;
+                        tokio::spawn(async move {
+                            let result = send_unsend(
+                                &im_client,
+                                preferred.as_deref(),
+                                &participants,
+                                sender_guid,
+                                target_id,
+                                parts,
+                            )
+                            .await;
+                            deliver(&hub, &client_id, send_result(client_msg_id, result)).await;
+                        });
+                    }
                     AppBody::CheckTargets { req_id, targets } => {
                         let im_client = Arc::clone(&im_client);
                         let hub = Arc::clone(hub);
@@ -1990,6 +2043,78 @@ async fn send_reaction(
     );
     send_and_confirm(im_client, &mut inst).await?;
     Ok(inst.id)
+}
+
+/// Replaces the text of the phone's own message `target_id` (its part `part`).
+async fn send_edit(
+    im_client: &IMClient,
+    preferred_handle: Option<&str>,
+    raw_targets: &[String],
+    sender_guid: Option<String>,
+    target_id: String,
+    part: u8,
+    text: String,
+) -> Result<String> {
+    if text.trim().is_empty() {
+        bail!("An edit can't be empty (unsend the message instead)");
+    }
+    let out = outgoing_conversation(im_client, preferred_handle, raw_targets, sender_guid, false).await?;
+    let new_parts = MessageParts(vec![IndexedMessagePart {
+        part: MessagePart::Text(text, Default::default()),
+        idx: None,
+        ext: None,
+    }]);
+    let mut inst = MessageInst::new(
+        out.conv,
+        &out.me,
+        Message::Edit(EditMessage {
+            tuuid: target_id.clone(),
+            edit_part: part as u64,
+            new_parts,
+        }),
+    );
+    info!(
+        "[client->apple] sending edit id={} on={} part={} to={:?}",
+        inst.id, target_id, part, out.targets
+    );
+    send_and_confirm(im_client, &mut inst).await?;
+    Ok(inst.id)
+}
+
+/// Takes back the phone's own message `target_id`, each of its `parts`.
+async fn send_unsend(
+    im_client: &IMClient,
+    preferred_handle: Option<&str>,
+    raw_targets: &[String],
+    sender_guid: Option<String>,
+    target_id: String,
+    parts: u8,
+) -> Result<String> {
+    let out = outgoing_conversation(im_client, preferred_handle, raw_targets, sender_guid, false).await?;
+    let mut first_id = None;
+    for part in 0..parts.max(1) {
+        let mut inst = MessageInst::new(
+            out.conv.clone(),
+            &out.me,
+            Message::Unsend(UnsendMessage {
+                tuuid: target_id.clone(),
+                edit_part: part as u64,
+            }),
+        );
+        info!(
+            "[client->apple] sending unsend id={} on={} part={} to={:?}",
+            inst.id, target_id, part, out.targets
+        );
+        match send_and_confirm(im_client, &mut inst).await {
+            Ok(()) => {
+                first_id.get_or_insert(inst.id);
+            }
+            // The first part decides: once one went out, the message is (partly) taken back.
+            Err(e) if first_id.is_none() => return Err(e),
+            Err(e) => warn!("unsend of {} part {} failed: {:#}", target_id, part, e),
+        }
+    }
+    first_id.ok_or_else(|| anyhow!("nothing to unsend"))
 }
 
 /// (kind, emoji, enable) of an incoming tapback, or None for iMessage-app updates.
