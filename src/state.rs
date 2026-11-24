@@ -108,10 +108,6 @@ impl ClientState {
         (seq, dropped)
     }
 
-    pub fn enqueue(&mut self, body: &[u8]) -> u64 {
-        self.enqueue_bounded(body).0
-    }
-
     pub fn ack_up_to(&mut self, seq: u64) -> usize {
         let before = self.outbox.len();
         self.outbox.retain(|&k, _| k > seq);
@@ -183,8 +179,8 @@ mod tests {
         assert_eq!(st.tx_seq, 0);
         assert_eq!(st.last_rx_seq, 0);
 
-        let s1 = st.enqueue(b"hello");
-        let s2 = st.enqueue(b"world");
+        let s1 = st.enqueue_bounded(b"hello").0;
+        let s2 = st.enqueue_bounded(b"world").0;
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
         st.last_rx_seq = 5;

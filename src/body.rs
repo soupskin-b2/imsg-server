@@ -33,7 +33,10 @@ pub const REG_STATE_RENEWING: u8 = 1;
 pub const REG_STATE_NEEDS_PHONE: u8 = 2;
 pub const REG_STATE_FAILED: u8 = 3;
 
+// Receipt kinds: part of the protocol, but the server no longer sends receipts to the phone.
+#[allow(dead_code)]
 pub const RECEIPT_DELIVERED: u8 = 1;
+#[allow(dead_code)]
 pub const RECEIPT_READ: u8 = 2;
 
 /// Incoming attachment kinds (what the phone should expect from MEDIA_GET).
