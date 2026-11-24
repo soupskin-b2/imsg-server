@@ -44,10 +44,16 @@ type HmacSha256 = Hmac<Sha256>;
 const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-/// OpenBubbles/relayserver sends an app-level `ping` every 60s (and panics/disconnects on
-/// server-initiated pings or WS Ping frames), so we passively enforce a 3x idle timeout.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// OpenBubbles/relayserver sends an app-level `ping` every 60s, but its timer runs on iOS
+/// uptime, which stops while the iPhone sleeps: an idle, sleeping iPhone goes silent for many
+/// minutes while still answering at once whatever we send it. So silence is not a reason to
+/// drop the provider (that made it reconnect every ~3 minutes and pushed a REG_INFO to the phone
+/// each time). A dead link is found by OS TCP keepalives instead (see [`enable_keepalive`],
+/// answered by the iPhone's kernel even asleep), and a hung app by [`COMMAND_TIMEOUT`]. We
+/// can't ping it ourselves: relayserver panics/disconnects on server pings or WS Ping frames.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_RETRIES: u32 = 4;
 const AUTH_WINDOW: Duration = Duration::from_secs(60);
 const MAX_AUTH_FAILURES_PER_WINDOW: usize = 20;
 
@@ -56,6 +62,19 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Turns on OS TCP keepalives for a connection that turned out to be for the relay, so a provider
+/// that vanished (iPhone off, network gone) is noticed in about 4 minutes without depending on its
+/// app-level pings (see [`KEEPALIVE_IDLE`]). Phone push connections leave keepalives off.
+pub fn enable_keepalive(stream: &tokio::net::TcpStream, peer: SocketAddr) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        warn!("relay connection {}: could not enable TCP keepalive: {}", peer, e);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -722,10 +741,6 @@ impl RelayHub {
             return;
         }
 
-        let mut idle_tick = tokio::time::interval(IDLE_CHECK_INTERVAL);
-        idle_tick.tick().await; // consume immediate tick
-        let mut last_rx = Instant::now();
-
         loop {
             tokio::select! {
                 maybe_out = out_rx.recv() => {
@@ -742,21 +757,9 @@ impl RelayHub {
                         }
                     }
                 }
-                _ = idle_tick.tick() => {
-                    if last_rx.elapsed() >= IDLE_TIMEOUT {
-                        warn!(
-                            "relay provider {} timed out (no traffic for {}s)",
-                            peer,
-                            IDLE_TIMEOUT.as_secs()
-                        );
-                        let _ = ws_sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                }
                 maybe_in = ws_stream.next() => {
                     match maybe_in {
                         Some(Ok(Message::Text(txt))) => {
-                            last_rx = Instant::now();
                             match serde_json::from_str::<IncomingWsMsg>(&txt) {
                                 Ok(msg) => match msg.command.as_str() {
                                     "ping" => {
@@ -803,14 +806,11 @@ impl RelayHub {
                             }
                         }
                         Some(Ok(Message::Ping(payload))) => {
-                            last_rx = Instant::now();
                             if ws_sink.send(Message::Pong(payload)).await.is_err() {
                                 break;
                             }
                         }
-                        Some(Ok(Message::Pong(_))) => {
-                            last_rx = Instant::now();
-                        }
+                        Some(Ok(Message::Pong(_))) => {}
                         Some(Ok(Message::Close(_))) | None => {
                             info!("relay provider {} closed connection", peer);
                             break;

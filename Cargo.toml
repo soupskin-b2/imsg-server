@@ -31,6 +31,7 @@ tokio-tungstenite = "0.20"
 futures-util = "0.3"
 hmac = "0.12"
 openssl = "0.10"
+socket2 = "0.5"
 
 [profile.release]
 lto = "thin"

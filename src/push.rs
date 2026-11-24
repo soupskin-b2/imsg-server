@@ -667,6 +667,9 @@ async fn handle_tcp_conn(
         return Ok(());
     }
 
+    if first[0].is_ascii_uppercase() {
+        crate::relay::enable_keepalive(tls_stream.get_ref().0, peer);
+    }
     let prefixed = PrefixedStream::new(first[0], tls_stream);
     if first[0] == FRAME_HELLO {
         handle_stream(prefixed, peer, hub, incoming_tx).await
