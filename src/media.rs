@@ -16,7 +16,7 @@ use crate::body::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, info, warn};
-use rustpush::{APSConnection, Attachment, AttachmentType, MMCSFile};
+use rustpush::{APSConnection, Attachment, AttachmentType, MMCSFile, PushError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -41,8 +41,47 @@ const FULL_VIDEO_MAX_PX: u32 = 1080;
 const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 const CONVERT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Tries of one download from Apple when it fails in a way worth trying again (a missed APS
+/// answer, a network error); the phone retries later on top of that.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
 const UPLOAD_RETENTION: Duration = Duration::from_secs(24 * 3600);
 const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// A failure that may well not happen again (Apple not reachable yet, an APS answer that didn't
+/// come, a network error), as opposed to one that will (an unknown attachment, a file ffmpeg can't
+/// convert). The phone gives up on an attachment for good when it gets MEDIA_ERR, so these are
+/// answered by closing the media connection instead, which makes it try again later.
+#[derive(Debug)]
+pub struct TryLater(pub String);
+
+impl std::fmt::Display for TryLater {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TryLater {}
+
+/// Whether `e` (from [`MediaStore::variant`]) is worth retrying later.
+pub fn is_try_later(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<TryLater>())
+}
+
+/// Whether a rustpush download error is likely to go away on its own.
+fn transient(e: &PushError) -> bool {
+    match e {
+        PushError::SendTimedOut
+        | PushError::NotConnected
+        | PushError::RequestError(_)
+        | PushError::IoError(_)
+        | PushError::TLSError(_)
+        | PushError::ConnectionClosed(_)
+        | PushError::APSSendError(_)
+        | PushError::ResourceTimeout => true,
+        PushError::StatusError(s) => s.is_server_error() || s.as_u16() == 429,
+        _ => false,
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Meta {
@@ -288,7 +327,10 @@ impl MediaStore {
         }
         let heif_dec = which("heif-dec").or_else(|| which("heif-convert"));
         if heif_dec.is_none() {
-            info!("heif-dec not found; decoding HEIC photos with ffmpeg (install libheif-examples)");
+            warn!(
+                "heif-dec not found: iPhone photos (HEIC) are decoded with ffmpeg, which before 8.1 \
+                 shows only one 512 px tile of each (install libheif-examples)"
+            );
         }
         Ok(Self {
             dir,
@@ -485,33 +527,60 @@ impl MediaStore {
         match &att.a_type {
             AttachmentType::Inline(data) => fs::write(&tmp, data)?,
             AttachmentType::MMCS(_) => {
-                let conn = self
-                    .aps
-                    .read()
-                    .unwrap()
-                    .clone()
-                    .ok_or_else(|| anyhow!("not connected to Apple yet"))?;
-                let file = fs::File::create(&tmp)?;
-                let mut writer = BufWriter::new(file);
-                let started = std::time::Instant::now();
-                tokio::time::timeout(
-                    DOWNLOAD_TIMEOUT,
-                    att.get_attachment(&conn, &mut writer, |_, _| {}),
-                )
-                .await
-                .map_err(|_| anyhow!("download from Apple timed out"))?
-                .map_err(|e| anyhow!("download from Apple failed: {}", e))?;
-                writer.flush()?;
-                debug!(
-                    "downloaded attachment {} ({} bytes) in {:?}",
-                    id,
-                    fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0),
-                    started.elapsed()
-                );
+                let mut attempt = 1;
+                loop {
+                    let conn = self
+                        .aps
+                        .read()
+                        .unwrap()
+                        .clone()
+                        .ok_or_else(|| anyhow::Error::new(TryLater("not connected to Apple yet".into())))?;
+                    let started = std::time::Instant::now();
+                    match Self::download_once(&att, &conn, &tmp).await {
+                        Ok(()) => {
+                            info!(
+                                "downloaded attachment {} from Apple ({} bytes) in {:?}",
+                                id,
+                                fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0),
+                                started.elapsed()
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&tmp);
+                            let again = is_try_later(&e);
+                            if !again || attempt >= DOWNLOAD_ATTEMPTS {
+                                return Err(e);
+                            }
+                            warn!(
+                                "download of attachment {} from Apple failed (try {} of {}), trying again: {:#}",
+                                id, attempt, DOWNLOAD_ATTEMPTS, e
+                            );
+                            tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                            attempt += 1;
+                        }
+                    }
+                }
             }
         }
         fs::rename(&tmp, &path)?;
         Ok(path)
+    }
+
+    /// One download of an MMCS attachment into `tmp`.
+    async fn download_once(att: &Attachment, conn: &APSConnection, tmp: &Path) -> Result<()> {
+        let file = fs::File::create(tmp)?;
+        let mut writer = BufWriter::new(file);
+        match tokio::time::timeout(DOWNLOAD_TIMEOUT, att.get_attachment(conn, &mut writer, |_, _| {})).await {
+            Err(_) => return Err(TryLater("download from Apple timed out".into()).into()),
+            Ok(Err(e)) if transient(&e) => {
+                return Err(TryLater(format!("download from Apple failed: {} ({:?})", e, e)).into())
+            }
+            Ok(Err(e)) => bail!("download from Apple failed: {} ({:?})", e, e),
+            Ok(Ok(())) => {}
+        }
+        writer.flush()?;
+        Ok(())
     }
 
     async fn run(&self, prog: &str, args: &[String]) -> Result<Vec<u8>> {
@@ -566,9 +635,38 @@ impl MediaStore {
         Ok(Probe::parse(&out))
     }
 
-    /// HEIC/HEIF to PNG with libheif (handles iPhone tiled images and rotation); `None` if
-    /// heif-dec is not installed or failed, so ffmpeg can try instead.
+    /// HEIC/HEIF to a PNG the scaling step can read; `None` if neither decoder managed (ffmpeg
+    /// then tries the original). iPhone photos are grids of 512 px HEVC tiles: libheif puts them
+    /// together and rotates the result. ffmpeg 8.1+ does too, but only for a plain decode: with
+    /// `-vf` on the same command it refuses ("Simple and complex filtering cannot be used
+    /// together"), which failed every photo preview. ffmpeg 7.1 (Debian 13) ignores the grid and
+    /// gives one tile, so heif-dec is the one to have.
     async fn decode_heif(&self, input: &Path, work: &Path) -> Option<PathBuf> {
+        if let Some(png) = self.decode_heif_libheif(input, work).await {
+            return Some(png);
+        }
+        let out = work.join("grid.png");
+        let res = self
+            .ffmpeg(vec![
+                "-i".into(),
+                input.to_string_lossy().into_owned(),
+                "-frames:v".into(),
+                "1".into(),
+                out.to_string_lossy().into_owned(),
+            ])
+            .await;
+        match res {
+            Ok(()) if out.exists() => Some(out),
+            Ok(()) => None,
+            Err(e) => {
+                warn!("decoding HEIC with ffmpeg failed: {:#}", e);
+                None
+            }
+        }
+    }
+
+    /// HEIC/HEIF to PNG with libheif's heif-dec; `None` if it is not installed or failed.
+    async fn decode_heif_libheif(&self, input: &Path, work: &Path) -> Option<PathBuf> {
         let tool = self.heif_dec.as_ref()?;
         let out = work.join("decoded.png");
         let res = self
@@ -707,8 +805,10 @@ impl MediaStore {
                         return passthrough();
                     }
                     let mut input = original.to_path_buf();
-                    if let Some(png) = self.decode_heif(original, &work).await {
-                        input = png;
+                    if is_heif(&meta.mime, &meta.uti, &meta.name) {
+                        if let Some(png) = self.decode_heif(original, &work).await {
+                            input = png;
+                        }
                     }
                     let probe = self.probe(&input).await.unwrap_or_default();
                     let png = meta.kind == ATTACH_STICKER || probe.has_alpha();
@@ -1116,6 +1216,9 @@ mod tests {
         assert_eq!(r.kind, ATTACH_VOICE);
         let err = store.variant(&r.media_id, false).await.unwrap_err();
         assert!(format!("{:#}", err).contains("not connected to Apple"), "{:#}", err);
+        assert!(is_try_later(&err), "the phone must retry this, not give up: {:#}", err);
+        let unknown = store.variant("0b9c0c6e-3c0e-4c55-9a39-5d1b0e1f2a3b", false).await.unwrap_err();
+        assert!(!is_try_later(&unknown), "{:#}", unknown);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1151,6 +1254,77 @@ mod tests {
             assert!(out.contains("aac"), "{}", out);
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn ffmpeg_version() -> Option<(u32, u32)> {
+        let out = std::process::Command::new("ffmpeg").arg("-version").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let v = text.split_whitespace().nth(2)?.trim_start_matches('n');
+        let mut parts = v.split(|c: char| !c.is_ascii_digit());
+        Some((parts.next()?.parse().ok()?, parts.next().and_then(|m| m.parse().ok()).unwrap_or(0)))
+    }
+
+    async fn image_size(path: &Path) -> (u32, u32) {
+        let out = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        let (w, h) = s.trim().split_once(',').unwrap();
+        (w.parse().unwrap(), h.parse().unwrap())
+    }
+
+    /// An iPhone-style photo (HEIC made of 256 px tiles, 768x512 in all) gets a preview and a
+    /// full-size JPEG of the whole picture. With ffmpeg 8.1+ and no heif-dec, the preview used to
+    /// fail outright ("Simple and complex filtering cannot be used together").
+    #[tokio::test]
+    async fn tiled_heic_photo_converts() {
+        if which("ffmpeg").is_none() || which("ffprobe").is_none() {
+            eprintln!("ffmpeg not installed; skipping");
+            return;
+        }
+        let heic = include_bytes!("../testdata/tiled_photo.heic").to_vec();
+        let ffmpeg_joins_tiles = ffmpeg_version().map_or(false, |v| v >= (8, 1));
+        for libheif in [true, false] {
+            let dir = std::env::temp_dir().join(format!("imsg-media-test-{}", Uuid::new_v4()));
+            let mut store = MediaStore::new(&dir, None, 30).unwrap();
+            if !libheif {
+                store.heif_dec = None;
+            } else if store.heif_dec.is_none() {
+                eprintln!("heif-dec not installed; testing ffmpeg only");
+                continue;
+            }
+            let store = Arc::new(store);
+            let att = Attachment {
+                a_type: AttachmentType::Inline(heic.clone()),
+                part: 0,
+                uti_type: "public.heic".into(),
+                mime: "image/heic".into(),
+                name: "IMG_0001.HEIC".into(),
+                iris: false,
+            };
+            let r = store.register_incoming(&att, false, false).unwrap();
+            assert_eq!(r.kind, ATTACH_IMAGE);
+            for full in [false, true] {
+                let v = store
+                    .variant(&r.media_id, full)
+                    .await
+                    .unwrap_or_else(|e| panic!("libheif={} full={}: {:#}", libheif, full, e));
+                assert_eq!(v.mime, "image/jpeg");
+                assert_eq!(v.name, "IMG_0001.jpg");
+                if libheif || ffmpeg_joins_tiles {
+                    let (w, h) = image_size(&v.path).await;
+                    if full {
+                        assert_eq!((w, h), (768, 512), "libheif={}", libheif);
+                    } else {
+                        assert!(w == 640 && (426..=427).contains(&h), "libheif={}: {}x{}", libheif, w, h);
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

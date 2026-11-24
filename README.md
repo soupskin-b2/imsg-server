@@ -37,8 +37,10 @@ What crosses the bridge:
 - A jailbroken iPhone running [OpenBubbles/relayserver](https://github.com/OpenBubbles/relayserver),
   which supplies iOS validation data to this server's built-in relay.
 - The flip phone, with the SIM for the number you want to use.
-- `ffmpeg` (and ideally `heif-dec`) on the server for photos and videos:
-  `sudo apt install ffmpeg libheif-examples`. Without them attachments arrive as placeholders.
+- `ffmpeg` and `heif-dec` on the server for photos and videos:
+  `sudo apt install ffmpeg libheif-examples`. Without ffmpeg attachments arrive as placeholders;
+  without `heif-dec`, ffmpeg older than 8.1 (Debian 13 has 7.1) shows only one 512 px tile of
+  each iPhone photo.
 
 ## Install
 

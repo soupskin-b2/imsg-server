@@ -857,6 +857,15 @@ where
                 Frame::MediaGet { id, full, offset } => {
                     let variant = match media.variant(&id, full).await {
                         Ok(v) => v,
+                        Err(e) if crate::media::is_try_later(&e) => {
+                            // MEDIA_ERR would make the phone give up on the attachment for good
+                            // ("couldn't download"); a closed connection makes it try again later.
+                            warn!(
+                                "client '{}' MEDIA_GET {} (full={}) failed for now; closing so the phone retries: {:#}",
+                                client_id, id, full, e
+                            );
+                            return Ok(());
+                        }
                         Err(e) => {
                             warn!("client '{}' MEDIA_GET {} (full={}) failed: {:#}", client_id, id, full, e);
                             write_frame(&mut stream, &Frame::MediaErr { message: format!("{:#}", e) }).await?;
@@ -1233,5 +1242,45 @@ mod tests {
         let mut out = String::new();
         prefixed.read_to_string(&mut out).await.unwrap();
         assert_eq!(out, "GET /health HTTP/1.1\r\n");
+    }
+
+    /// MEDIA_ERR makes the phone give up on an attachment for good, so it is only for failures
+    /// that would happen again; Apple not being reachable closes the connection instead.
+    #[tokio::test]
+    async fn media_get_answers_permanent_failures_and_closes_on_retryable_ones() {
+        let dir = std::env::temp_dir().join(format!("imsg-push-media-{}", uuid::Uuid::new_v4()));
+        let media = Arc::new(MediaStore::new(&dir, Some("/nonexistent/ffmpeg"), 1).unwrap());
+        let att = rustpush::Attachment {
+            a_type: rustpush::AttachmentType::MMCS(rustpush::MMCSFile {
+                signature: vec![1; 21],
+                object: "o".into(),
+                url: "https://example.invalid/o".into(),
+                key: vec![2; 32],
+                size: 10,
+            }),
+            part: 0,
+            uti_type: "public.jpeg".into(),
+            mime: "image/jpeg".into(),
+            name: "IMG_0001.jpg".into(),
+            iris: false,
+        };
+        let r = media.register_incoming(&att, false, false).unwrap();
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn({
+            let media = Arc::clone(&media);
+            async move { handle_media(server, "c", media).await }
+        });
+        assert!(matches!(read_frame(&mut client).await.unwrap(), Some(Frame::Welcome { .. })));
+
+        write_frame(&mut client, &Frame::MediaGet { id: "nope".into(), full: false, offset: 0 }).await.unwrap();
+        match read_frame(&mut client).await.unwrap() {
+            Some(Frame::MediaErr { message }) => assert!(message.contains("unknown attachment"), "{}", message),
+            other => panic!("expected MEDIA_ERR, got {:?}", other.map(|f| f.frame_type())),
+        }
+
+        write_frame(&mut client, &Frame::MediaGet { id: r.media_id.clone(), full: false, offset: 0 }).await.unwrap();
+        assert!(read_frame(&mut client).await.unwrap().is_none(), "expected the connection to close");
+        task.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
