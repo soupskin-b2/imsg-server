@@ -2405,8 +2405,12 @@ mod tests {
             part(MessagePart::Attachment(att("report.pdf", "application/pdf", "com.adobe.pdf", &[0u8; 2048]))),
         ]);
         let (text, atts) = render_message(&nm, &media);
-        assert_eq!(text, "@Sam sent you money\n[Apple Cash]\n[File: report.pdf, 2 KB]");
-        assert!(atts.is_empty());
+        // The file is sent as an attachment (no preview) so the phone can download it.
+        assert_eq!(text, "@Sam sent you money\n[Apple Cash]");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].kind, ATTACH_FILE);
+        assert_eq!(atts[0].name, "report.pdf");
+        assert_eq!(atts[0].size, 2048);
     }
 
     #[tokio::test]
