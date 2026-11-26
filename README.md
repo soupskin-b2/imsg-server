@@ -22,8 +22,8 @@ What crosses the bridge:
   the full-size file (HEIC becomes a full-resolution JPEG, HEVC video becomes H.264). What the
   phone sends (JPEG, 3GP, AMR) is converted to what iPhones show inline; a voice recording sent on
   its own arrives as an iPhone audio message (`Audio Message.caf`, Opus), so like any audio message
-  it may expire on the iPhone unless kept. Other files arrive as
-  `[File: name, size]`.
+  it may expire on the iPhone unless kept. Other files (PDFs, zips, ...) arrive as
+  `[File: name, size]` with no preview, and the phone downloads the original on demand.
 - **Tapbacks**, shown as badges on the message, both ways (the phone sends the six standard ones).
 - **Edits** (`... (edited)`, earlier versions kept), **unsends** (the message stays, marked
   `Unsent`), and group **renames, member changes and photo changes** as notices in the conversation.
@@ -223,6 +223,7 @@ the other side act instead:
 | `/reply text` | answers with an inline reply to it |
 | `/edit text`, `/unsend` | edits or unsends its last echoed message |
 | `/photo`, `/video`, `/voice`, `/sticker` | sends a 12 MP photo, a 1080p MOV, a CAF voice message or a PNG sticker (needs ffmpeg) |
+| `/file` | sends a 150 KB PDF (a file with no preview, downloaded on demand) |
 | `/photos` | sends one message with four attachments (photo, sticker, photo, video) |
 
 Edits and unsends of your own messages are accepted (nothing is sent back); an edit to `/fail` is

@@ -122,6 +122,17 @@ fn echo_reg_info(
 fn echo_media(hub: &Arc<Hub>, kind: &str) -> anyhow::Result<body::InAttachment> {
     let dir = std::env::temp_dir().join(format!("imsg-echo-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir)?;
+    if kind == "file" {
+        // A document with no preview: the phone downloads the original on demand.
+        let out = dir.join("Report 2026.pdf");
+        let mut data = b"%PDF-1.4\n% imsg-server echo test file\n".to_vec();
+        data.resize(150 * 1024, b' ');
+        data.extend_from_slice(b"\n%%EOF\n");
+        std::fs::write(&out, &data)?;
+        let att = hub.media.register_local(&out, "Report 2026.pdf", "application/pdf");
+        let _ = std::fs::remove_dir_all(&dir);
+        return att;
+    }
     let (name, mime, args): (&str, &str, Vec<&str>) = match kind {
         "photo" => ("IMG_0042.jpg", "image/jpeg",
             vec!["-f", "lavfi", "-i", "testsrc2=size=3024x4032:rate=1", "-frames:v", "1"]),
@@ -153,7 +164,7 @@ fn normalize_echo(raw: &str) -> String {
 /// "other side" do something to the conversation instead of echoing:
 /// `/react N|emoji` (on the sent message), `/reply text`, `/edit text` and `/unsend` (on the
 /// last echo), `/rename name`, `/add handle`, `/remove handle`, `/icon`, `/photo`, `/video`,
-/// `/voice`, `/sticker`, `/photos` (four attachments in one message). `/group text` has the other side start a group with a third person;
+/// `/voice`, `/sticker`, `/file`, `/photos` (four attachments in one message). `/group text` has the other side start a group with a third person;
 /// after that `/rename`, `/icon`, `/add`, `/remove` and `/gsay text` act on that group.
 #[allow(clippy::too_many_arguments)]
 fn echo_reply(
@@ -238,7 +249,7 @@ fn echo_reply(
                 }
             };
         }
-        "photo" | "video" | "voice" | "sticker" => {
+        "photo" | "video" | "voice" | "sticker" | "file" => {
             // The other side sends media made with ffmpeg (tests incoming attachments).
             match echo_media(hub, &cmd) {
                 Ok(att) => {

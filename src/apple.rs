@@ -1,5 +1,5 @@
 use crate::body::{
-    AppBody, InAttachment, OutAttachment, ATTACH_AUDIO, ATTACH_FILE, ATTACH_IMAGE, ATTACH_STICKER,
+    AppBody, InAttachment, OutAttachment, ATTACH_AUDIO, ATTACH_IMAGE, ATTACH_STICKER,
     ATTACH_VCARD, ATTACH_VIDEO, ATTACH_VOICE, GROUP_ICON, GROUP_PARTICIPANTS, GROUP_RENAMED,
     REACT_DISLIKE, REACT_EMOJI, REACT_EMPHASIZE, REACT_HEART, REACT_LAUGH, REACT_LIKE,
     REACT_QUESTION, REACT_STICKER, REG_STATE_FAILED,
@@ -2310,10 +2310,8 @@ fn render_message(nm: &NormalMessage, media: &Arc<MediaStore>) -> (String, Vec<I
                 let sticker = p.ext.is_some();
                 let size = a.get_size() as u64;
                 let kind = media::classify(&a.mime, &a.uti_type, &a.name, nm.voice, sticker);
-                if kind == ATTACH_FILE {
-                    push_line(&mut text, &attachment_placeholder(kind, &a.name, size));
-                    continue;
-                }
+                // Files (PDFs, zips, ...) have no preview; they are registered too so the phone
+                // can download the original on demand (MEDIA_GET full).
                 match media.register_incoming(a, nm.voice, sticker) {
                     Ok(r) => attachments.push(r),
                     Err(e) => {
@@ -2370,6 +2368,7 @@ async fn registered_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::ATTACH_FILE;
     use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
